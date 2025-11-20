@@ -7,19 +7,22 @@ from datasets import load_dataset
 
 from src.dataset.GSM8K import GSM8K
 from src.dataset.CodeAlpaca import CodeAlpacaDataset
+from src.dataset.SAMSum import SAMSumDataset
+from src.dataset.E2eNLG import E2eNLGDataset
 from src.dataset.EMOTION import EMOTIONDataset
 from src.dataset.EMOTION import load_train_EMOTION
 from src.dataset.EMOTION import load_test_EMOTION
 from torch.utils.data import DataLoader
 
 def dataloader(model_name =None, data_name=None, batch_size=None, distribution=500, train=True):
+    if model_name == 'GPT2':
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    elif model_name == 'Llama':
+        tokenizer = AutoTokenizer.from_pretrained('JackFram/llama-160m')
+    else:
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
     if data_name == 'GSM8K':
-        if model_name == 'GPT2':
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        elif model_name == 'Llama':
-            tokenizer = AutoTokenizer.from_pretrained('JackFram/llama-160m')
-        else:
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         if train:
             path = os.path.join("data/", f"train.jsonl")
 
@@ -56,17 +59,7 @@ def dataloader(model_name =None, data_name=None, batch_size=None, distribution=5
             return test_loader
 
     if data_name == 'CodeAlpaca':
-        if model_name == 'GPT2':
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        elif model_name == 'Llama':
-            tokenizer = AutoTokenizer.from_pretrained('JackFram/llama-160m')
-        else:
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
-        ds = load_dataset(
-            "HuggingFaceH4/CodeAlpaca_20K",
-            download_mode="reuse_dataset_if_exist"
-        )
+        ds = load_dataset("HuggingFaceH4/CodeAlpaca_20K")
         if train:
             train_list = list(ds['train'])
 
@@ -95,6 +88,84 @@ def dataloader(model_name =None, data_name=None, batch_size=None, distribution=5
 
             print(f"CodeAlpaca: {len(test_set)} test examples")
             test_set = CodeAlpacaDataset(tokenizer, test_set, set_max_len=512, loss_on_prefix=False)
+            test_loader = DataLoader(test_set, batch_size=4, shuffle=True)
+            return test_loader
+
+    if data_name == 'SAMSum':
+        ds = load_dataset("knkarthick/samsum")
+        if train:
+            train_list = list(ds['train'])
+
+            random.shuffle(train_list)
+            train_set = train_list[:distribution]
+
+            for ex in train_set:
+                clean_summary = ex['summary'].strip()
+                ex['dialogue'] = f"Dialogue:\n{ex['dialogue']}\n\nSummary:\n"
+                eos = tokenizer.eos_token if tokenizer.eos_token else "<|endoftext|>"
+                ex['summary'] = f"{clean_summary}{eos}"
+
+            print(f"SAMSum: {len(train_set)} training examples")
+            train_set = SAMSumDataset(tokenizer, train_set, set_max_len=512, loss_on_prefix=False)
+            train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+            return train_loader
+        else:
+            test_list = list(ds['test'])
+
+            random.shuffle(test_list)
+            test_set = test_list[:100]
+
+            for ex in test_set:
+                clean_summary = ex['summary'].strip()
+                ex['dialogue'] = f"Dialogue:\n{ex['dialogue']}\n\nSummary:\n"
+                eos = tokenizer.eos_token if tokenizer.eos_token else "<|endoftext|>"
+                ex['summary'] = f"{clean_summary}{eos}"
+
+            print(f"SAMSum: {len(test_set)} test examples")
+            test_set = SAMSumDataset(tokenizer, test_set, set_max_len=512, loss_on_prefix=False)
+            test_loader = DataLoader(test_set, batch_size=4, shuffle=True)
+            return test_loader
+
+    if data_name == 'E2eNLG':
+        _URL = "https://raw.githubusercontent.com/tuetschek/e2e-dataset/master/"
+        _TRAINING_FILE = "trainset.csv"
+        _DEV_FILE = "devset.csv"
+        _TEST_FILE = "testset_w_refs.csv"
+        files = {
+            "train": _URL + "trainset.csv",
+            "validation": _URL + "devset.csv",
+            "test": _URL + "testset_w_refs.csv"
+        }
+
+        ds = load_dataset("csv", data_files=files)
+        if train:
+            train_list = list(ds['train'])
+
+            random.shuffle(train_list)
+            train_set = train_list[:distribution]
+
+            for ex in train_list:
+                ex['mr'] = f"Data:\n{ex['mr']}\n\nText:\n"
+                eos = tokenizer.eos_token if tokenizer.eos_token else "<|endoftext|>"
+                ex['ref'] = f"{ex['ref']}{eos}"
+
+            print(f"E2eNLG: {len(train_set)} training examples")
+            train_set = E2eNLGDataset(tokenizer, train_set, set_max_len=512, loss_on_prefix=False)
+            train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+            return train_loader
+        else:
+            test_list = list(ds['test'])
+
+            random.shuffle(test_list)
+            test_set = test_list[:100]
+
+            for ex in test_set:
+                ex['mr'] = f"Data:\n{ex['mr']}\n\nText:\n"
+                eos = tokenizer.eos_token if tokenizer.eos_token else "<|endoftext|>"
+                ex['ref'] = f"{ex['ref']}{eos}"
+
+            print(f"E2eNLG: {len(test_set)} test examples")
+            test_set = E2eNLGDataset(tokenizer, test_set, set_max_len=512, loss_on_prefix=False)
             test_loader = DataLoader(test_set, batch_size=4, shuffle=True)
             return test_loader
 
