@@ -51,10 +51,8 @@ def val_Llama(model_name, data_name, state_dict_full, logger):
             ]
 
             for gen, ref in zip(generated_texts, reference_texts):
-                if not gen:
-                    gen = " "
-                if not ref:
-                    ref = " "
+                if not gen: gen = " "
+                if not ref: ref = " "
 
                 bleu_score = sentence_bleu(
                     [ref.split()],
