@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 import src.Log
+from transformers import GPT2Tokenizer
 class Ft_GPT2:
     def __init__(self, client_id, layer_id, channel, device):
         self.client_id = client_id
@@ -14,6 +15,7 @@ class Ft_GPT2:
         self.channel = channel
         self.device = device
         self.data_count = 0
+        self.tokenizer = None
 
     def send_intermediate_output(self, data_id, output, attention_mask, labels, trace):
 
@@ -94,7 +96,6 @@ class Ft_GPT2:
                         data_input = data_store.pop(data_id)
                         output, mask = model(input_ids=data_input[0], attention_mask=data_input[1])
                         output.backward(gradient=gradient)
-                        nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
                         optimizer.step()
                     else:
                         # speed control
@@ -105,7 +106,7 @@ class Ft_GPT2:
                             batch = next(data_iter)
                             input_ids = batch['input_ids'].to(self.device)
                             attention_mask = batch['attention_mask'].to(self.device)
-                            labels = batch['input_ids'].to(self.device)
+                            labels = batch['labels'].to(self.device)
                             data_id = uuid.uuid4()
                             data_store[data_id] = (input_ids, attention_mask)
 
@@ -143,8 +144,14 @@ class Ft_GPT2:
             time.sleep(0.5)
 
     def last_layer(self, model, lr, weight_decay, clip_grad_norm):
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            pad_id = tokenizer.eos_token_id
+
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
         result = True
 
         forward_queue_name = f'intermediate_queue_{self.layer_id - 1}'
@@ -156,7 +163,6 @@ class Ft_GPT2:
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=forward_queue_name, auto_ack=True)
             if method_frame and body:
-
                 optimizer.zero_grad()
                 received_data = pickle.loads(body)
                 intermediate_output_numpy = received_data["data"]
@@ -168,8 +174,15 @@ class Ft_GPT2:
                 intermediate_output = torch.tensor(intermediate_output_numpy, requires_grad=True).to(self.device)
 
                 output, _ = model(input_ids=intermediate_output, attention_mask=attention_mask)
+                shift_logits = output[:, :-1, :].contiguous()  # [B, L-1, V]
+                shift_labels = labels[:, 1:].contiguous()  # [B, L-1]
 
-                loss = criterion(output.view(-1, output.size(-1)), labels.view(-1))
+                loss = criterion(
+                    shift_logits.view(-1, shift_logits.size(-1)),  # [(B*(L-1)), V]
+                    shift_labels.view(-1)  # [(B*(L-1))]
+                )
+
+                # loss = criterion(output.view(-1, output.size(-1)), labels.view(-1))
                 if torch.isnan(loss).any():
                     src.Log.print_with_color("NaN detected in loss", "yellow")
                     result = False
@@ -178,7 +191,6 @@ class Ft_GPT2:
                 intermediate_output.retain_grad()
                 loss.backward()
 
-                nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
                 optimizer.step()
                 self.data_count += 1
 
@@ -200,7 +212,6 @@ class Ft_GPT2:
 
     def alone_training(self, model, lr, momentum, clip_grad_norm, train_loader=None, cluster=None):
         pass
-
 
 
 

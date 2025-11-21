@@ -4,20 +4,35 @@ from tqdm import tqdm
 from src.dataset.dataloader import dataloader
 from transformers import GPT2Tokenizer
 from src.model.GPT2 import GPT2
-import math
 
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from rouge_score import rouge_scorer
+import re
 
+def extract_final_number(s: str) -> str:
+
+    if s is None:
+        return ""
+
+    m = re.search(r"####\s*([\-+]?\d+(?:\.\d+)?)", s)
+    if m:
+        return m.group(1).strip()
+
+    nums = re.findall(r"[\-+]?\d+(?:\.\d+)?", s)
+    if nums:
+        return nums[-1].strip()
+    return ""
 
 def val_GPT2(model_name, data_name, state_dict_full, logger):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Eval device:", device)
 
-    smooth = SmoothingFunction().method1
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+
+    pad_id = tokenizer.pad_token_id
+
+    loss_fct = nn.CrossEntropyLoss(
+        ignore_index=pad_id,
+    )
 
     test_loader = dataloader(model_name=model_name, data_name=data_name, train=False)
 
@@ -26,18 +41,28 @@ def val_GPT2(model_name, data_name, state_dict_full, logger):
     model = model.to(device)
     model.eval()
 
-    total_bleu = 0.0
-    total_rouge = 0.0
-    total_perplexity = 0.0
-    count = 0
+    total_loss = 0.0
+    total_tokens = 0
+
+    total_samples = 0
+    correct_samples = 0
 
     with torch.no_grad():
         for batch in tqdm(test_loader):
             input_ids = batch['input_ids'].to(device)
             mask = batch['attention_mask'].to(device)
-            labels = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
 
             logits, _ = model(input_ids, mask)
+
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+            total_loss += loss.item()
 
             predicted_tokens = torch.argmax(logits, dim=-1)
 
@@ -55,45 +80,23 @@ def val_GPT2(model_name, data_name, state_dict_full, logger):
                     gen = " "
                 if not ref:
                     ref = " "
+            #     print(f'gen : {gen}')
+            #     print(f'ref : {ref}')
+            #     break
+            # break
 
-                bleu_score = sentence_bleu(
-                    [ref.split()],
-                    gen.split(),
-                    smoothing_function=smooth
-                )
+                pred_num = extract_final_number(gen)
+                gold_num = extract_final_number(ref)
 
-                try:
-                    rouge_l = scorer.score(ref, gen)["rougeL"].fmeasure
-                except:
-                    rouge_l = 0.0
+                total_samples += 1
+                if gold_num and pred_num == gold_num:
+                    correct_samples += 1
 
-                total_bleu += bleu_score
-                total_rouge += rouge_l
-                count += 1
+    avg_loss = total_loss / max(total_samples, 1)
+    accuracy = correct_samples / max(total_samples, 1)
 
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-
-            loss_fct = nn.CrossEntropyLoss(
-                ignore_index=tokenizer.pad_token_id,
-                reduction='sum'
-            )
-
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1)
-            )
-
-            valid_tokens = (shift_labels != tokenizer.pad_token_id).sum().item()
-            perplexity = math.exp(loss.item() / max(1, valid_tokens))
-            total_perplexity += perplexity
-
-    avg_bleu = total_bleu / count
-    avg_rouge = total_rouge / count
-    avg_perplexity = total_perplexity / count
-
-    print(f"Evaluation Results: BLEU: {avg_bleu:.4f}, ROUGE-L: {avg_rouge:.4f}, Perplexity: {avg_perplexity:.4f}")
+    print(f"Loss / token : {avg_loss:.4f}; Accuracy (answer) : {accuracy * 100:.2f}%")
 
     logger.log_info(
-        f"Evaluation Results: BLEU: {avg_bleu:.4f}, ROUGE-L: {avg_rouge:.4f}, Perplexity: {avg_perplexity:.4f}"
+        f"Loss / token : {avg_loss:.4f}; Accuracy (answer) : {accuracy * 100:.2f}%"
     )

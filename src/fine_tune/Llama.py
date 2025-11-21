@@ -95,7 +95,6 @@ class Ft_Llama:
                         data_input = data_store.pop(data_id)
                         output, mask = model(input_ids=data_input[0], attention_mask=data_input[1])
                         output.backward(gradient=gradient)
-                        nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
                         optimizer.step()
                     else:
                         # speed control
@@ -178,10 +177,7 @@ class Ft_Llama:
                 print(f"Loss: {loss.item()}")
                 intermediate_output.retain_grad()
                 loss.backward()
-                if clip_grad_norm and clip_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
 
-                nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
                 optimizer.step()
                 self.data_count += 1
 

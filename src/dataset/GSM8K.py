@@ -28,8 +28,16 @@ class GSM8K(torch.utils.data.Dataset):
         self.examples = examples
         self.qns = [ex["question"] for ex in self.examples]
         self.ans = [ex["answer"] for ex in self.examples]
+
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            pad_id = tokenizer.eos_token_id
+        self.pad_id = pad_id
+
         self.qns = tokenizer(self.qns, padding=False)
         self.ans = tokenizer(self.ans, padding=False)
+
         self.loss_on_prefix = loss_on_prefix
         self.max_len = max(
             [
@@ -45,13 +53,29 @@ class GSM8K(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         qn_tokens = self.qns["input_ids"][idx]
         ans_tokens = self.ans["input_ids"][idx]
-        pad_tokens = [0] * (self.max_len - len(qn_tokens) - len(ans_tokens))
-        tokens = qn_tokens + ans_tokens + pad_tokens
-        mask = (
-            ([int(self.loss_on_prefix)] * len(qn_tokens))
-            + ([1] * len(ans_tokens))
-            + ([0] * len(pad_tokens))
+
+        tokens = qn_tokens + ans_tokens
+
+        attn = [1] * len(tokens)
+
+        pad_len = self.max_len - len(tokens)
+        if pad_len > 0:
+            tokens += [self.pad_id] * pad_len
+            attn += [0] * pad_len
+
+        labels = tokens.copy()
+
+        if not self.loss_on_prefix:
+            q_len = len(qn_tokens)
+            for i in range(q_len):
+                labels[i] = self.pad_id
+
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        attn = torch.tensor(attn, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
+
+        return dict(
+            input_ids=tokens,
+            attention_mask=attn,
+            labels=labels,
         )
-        tokens = torch.tensor(tokens)
-        mask = torch.tensor(mask)
-        return dict(input_ids=tokens, attention_mask=mask)

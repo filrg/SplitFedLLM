@@ -38,7 +38,7 @@ def dataloader(model_name =None, data_name=None, batch_size=None, distribution=5
 
             print(f"{len(train_set)} train examples")
 
-            train_set = GSM8K(tokenizer, train_set)
+            train_set = GSM8K(tokenizer, train_set, False)
             train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
             return train_loader
         else:
@@ -48,13 +48,13 @@ def dataloader(model_name =None, data_name=None, batch_size=None, distribution=5
 
             random.shuffle(data)
 
-            test_set = data[:100]
+            test_set = data[:500]
             for ex in test_set:
                 ex.update(question=ex["question"] + "\n")
                 ex.update(answer=ex["answer"] + "<|endoftext|>")
 
             print(f"{len(test_set)} test examples")
-            test_set = GSM8K(tokenizer, test_set)
+            test_set = GSM8K(tokenizer, test_set,False)
             test_loader = DataLoader(test_set, batch_size=4, shuffle=False)
             return test_loader
 
