@@ -1,13 +1,14 @@
 import torch
 
 class E2eNLGDataset(torch.utils.data.Dataset):
-    def __init__(self, tokenizer, examples, set_max_len=512, loss_on_prefix=False):
+    def __init__(self, tokenizer, examples, set_max_len=512, loss_on_prefix=True):
         self.examples = examples
         self.qns = [ex["mr"] for ex in self.examples]
         self.ans = [ex["ref"] for ex in self.examples]
         self.qns = tokenizer(self.qns, padding=False)
         self.ans = tokenizer(self.ans, padding=False)
         self.loss_on_prefix = loss_on_prefix
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id else tokenizer.eos_token_id
 
         self.max_len = max(
             [
@@ -26,18 +27,25 @@ class E2eNLGDataset(torch.utils.data.Dataset):
         ans_tokens = self.ans["input_ids"][idx]
 
         tokens = qn_tokens + ans_tokens
-        mask = (
-                ([int(self.loss_on_prefix)] * len(qn_tokens))
-                + ([1] * len(ans_tokens))
-        )
+        mask = [1] * len(tokens)
 
-        if len(tokens) > self.max_len:
+        pad_len = self.max_len - len(tokens)
+        if pad_len >= 0:
+            tokens += [self.pad_id] * pad_len
+            mask += [0] * pad_len
+        else:
             tokens, mask = tokens[:self.max_len], mask[:self.max_len]
-        elif len(tokens) <= self.max_len:
-            pad_len = self.max_len - len(tokens)
-            tokens = tokens + [0] * pad_len
-            mask = mask + [0] * pad_len
 
-        tokens = torch.tensor(tokens)
-        mask = torch.tensor(mask)
-        return dict(input_ids=tokens, attention_mask=mask)
+        labels = tokens.copy()
+        if not self.loss_on_prefix:
+            for i in range(len(qn_tokens)):
+                labels[i] = self.pad_id
+
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        mask = torch.tensor(mask, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
+        return dict(
+            input_ids=tokens,
+            attention_mask=mask,
+            labels=labels
+        )
