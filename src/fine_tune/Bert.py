@@ -7,6 +7,28 @@ import torch
 import torch.nn as nn
 
 import src.Log
+
+class QuantInt8STE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # per-sample scale: shape [B,1,1]
+        with torch.no_grad():
+            # avoid zero scale
+            scale = x.abs().amax(dim=(1, 2), keepdim=True) / 127.0
+            scale = torch.clamp(scale, min=1e-8)
+            q = torch.clamp((x / scale).round(), -127, 127)
+            y = q * scale
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # Straight-through estimator
+        return grad_out
+
+def qdq_int8_ste(x):
+    return QuantInt8STE.apply(x)
+
+
 class Ft_Bert:
     def __init__(self, client_id, layer_id, channel, device):
         self.client_id = client_id
@@ -63,7 +85,7 @@ class Ft_Bert:
                                    routing_key='rpc_queue',
                                    body=pickle.dumps(message))
 
-    def first_layer(self, model, lr, weight_decay, clip_grad_norm, control_count=1, train_loader=None):
+    def first_layer(self, model, lr, weight_decay, control_count=1, train_loader=None, quantization_config=None):
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         backward_queue_name = f'gradient_queue_{self.layer_id}_{self.client_id}'
@@ -72,9 +94,6 @@ class Ft_Bert:
         model = model.to(self.device)
 
         data_iter = iter(train_loader)
-        forward = []
-        backward = []
-        comm = []
         num_forward = 0
         num_backward = 0
         end_data = False
@@ -96,15 +115,12 @@ class Ft_Bert:
                     data_id = received_data["data_id"]
 
                     data_input = data_store.pop(data_id)
-                    start_backward = time.time()
                     output = model(input_ids=data_input)
                     output.backward(gradient=gradient)
                     optimizer.step()
-                    time_backward = time.time() - start_backward
-                    backward.append(time_backward)
                 else:
                     # speed control
-                    if len(data_store) > control_count:
+                    if len(data_store) >= control_count:
                         continue
 
                     try:
@@ -114,20 +130,16 @@ class Ft_Bert:
                         data_id = uuid.uuid4()
                         data_store[data_id] = input_ids
 
-                        start_forward = time.time()
                         intermediate_output = model(input_ids=input_ids)
-                        time_forward = time.time() - start_forward
-                        forward.append(time_forward)
+                        # if quantization_config['enable']:
+                        #     intermediate_output = qdq_int8_ste(intermediate_output)
                         intermediate_output = intermediate_output.detach().requires_grad_(True)
 
                         num_forward += 1
                         self.data_count += 1
 
                         pbar.update(1)
-                        start_comm = time.time()
                         self.send_intermediate_output(data_id, intermediate_output, labels, trace=None)
-                        time_comm = time.time() - start_comm
-                        comm.append(time_comm)
 
                     except StopIteration:
                         end_data = True
@@ -149,13 +161,10 @@ class Ft_Bert:
                 received_data = pickle.loads(body)
                 src.Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
                 if received_data["action"] == "PAUSE":
-                    print(f'Forward time: {forward}s.')
-                    print(f'Backward time: {backward}s.')
-                    print(f'Comm time: {comm}s.')
                     return True, self.data_count
             time.sleep(0.5)
 
-    def last_layer(self, model, lr, weight_decay, clip_grad_norm):
+    def last_layer(self, model, lr, weight_decay, quantization_config=None):
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         criterion = nn.CrossEntropyLoss()
         result = True
@@ -166,8 +175,6 @@ class Ft_Bert:
         print('Waiting for intermediate output. To exit press CTRL+C')
         model.to(self.device)
         model.train()
-        execute = []
-        comm = []
 
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=forward_queue_name, auto_ack=True)
@@ -179,8 +186,7 @@ class Ft_Bert:
                 trace = received_data["trace"]
                 data_id = received_data["data_id"]
                 labels = received_data["label"].to(self.device)
-                start_exec = time.time()
-                intermediate_output = torch.tensor(intermediate_output_numpy, requires_grad=True).to(self.device)
+                intermediate_output = torch.tensor(intermediate_output_numpy, requires_grad=True).float().to(self.device)
 
                 output = model(input_ids=intermediate_output)
 
@@ -195,15 +201,10 @@ class Ft_Bert:
                 loss.backward()
 
                 optimizer.step()
-                time_exec = time.time() - start_exec
-                execute.append(time_exec)
                 self.data_count += 1
 
                 gradient = intermediate_output.grad
-                start_comm = time.time()
                 self.send_gradient(data_id, gradient, trace)
-                time_comm = time.time() - start_comm
-                comm.append(time_comm)
 
             else:
                 broadcast_queue_name = f'reply_{self.client_id}'
@@ -212,8 +213,6 @@ class Ft_Bert:
                     received_data = pickle.loads(body)
                     src.Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
                     if received_data["action"] == "PAUSE":
-                        print(f'Forward + Backward: {execute}s')
-                        print(f'Comm time: {comm}s')
                         return result, self.data_count
 
     def train_on_middle_layer(self, model, lr, momentum, clip_grad_norm, control_count=5, cluster=None):

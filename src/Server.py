@@ -9,8 +9,6 @@ import copy
 import src.Log
 import src.Utils
 
-from src.model.GPT2 import GPT2
-from src.model.Llama import Llama
 from src.model.Bert import Bert
 from src.val.get_val import get_val
 
@@ -51,6 +49,10 @@ class Server:
 
         # Fine tune config
         self.fine_tune_config = config['fine-tune']
+
+        # Bottleneck + Quantization
+        self.bottleneck_config = config['bottleneck']
+        self.quantization_config = config['quantization']
 
         if self.random_seed:
             random.seed(self.random_seed)
@@ -162,13 +164,14 @@ class Server:
                 # Test
                 if self.save_parameters and self.validation and self.round_result:
                     state_dict_full = self.concatenate()
-                    self.avg_state_dict = []
-                    if not get_val(self.model_name, self.data_name, state_dict_full,self.logger):
+
+                    if not get_val(self.avg_state_dict, self.cut_layers, self.bottleneck_config, self.logger):
                         self.logger.log_warning("Training failed!")
                     else:
                         # Save to files
                         torch.save(state_dict_full, f'{self.model_name}.pt')
                         self.round -= 1
+                    self.avg_state_dict = []
                 else:
                     self.round -= 1
 
@@ -191,14 +194,7 @@ class Server:
     def notify_clients(self, start=True, register=True):
 
         # Send message to clients when consumed all clients
-        if self.model_name == 'GPT2':
-            klass = GPT2
-        elif self.model_name == 'Llama':
-            klass = Llama
-        elif self.model_name == 'Bert':
-            klass = Bert
-        else:
-            klass = globals()[f'{self.model_name}']
+        klass = Bert
 
         for (client_id, layer_id) in self.list_clients:
             # Read parameters file
@@ -211,21 +207,31 @@ class Server:
                         full_state_dict = torch.load(filepath, weights_only=True)
 
                         if layer_id == 1:
-                            model = klass(layer_id=1, n_block=self.cut_layers)
+                            if self.bottleneck_config["enable"]:
+                                model = klass(layer_id=1, n_block=self.cut_layers, reduce_comm=True,
+                                              bottleneck_dim=self.bottleneck_config['bottleneck_dim'])
+                            else:
+                                model = klass(layer_id=1, n_block=self.cut_layers)
                             state_dict = model.state_dict()
                             keys = state_dict.keys()
 
                             for key in keys:
-                                state_dict[key] = full_state_dict[key]
+                                if key in full_state_dict:
+                                    state_dict[key] = full_state_dict[key]
 
                         else:
-                            model = klass(layer_id=2, n_block=self.total_block - self.cut_layers)
+                            if self.bottleneck_config["enable"]:
+                                model = klass(layer_id=2, n_block=12 - self.cut_layers, reduce_comm=True,
+                                              bottleneck_dim=self.bottleneck_config['bottleneck_dim'])
+                            else:
+                                model = klass(layer_id=2, n_block=12 - self.cut_layers)
                             state_dict = model.state_dict()
                             state_dict = src.Utils.change_keys(state_dict, self.cut_layers, True)
                             keys = state_dict.keys()
 
                             for key in keys:
-                                state_dict[key] = full_state_dict[key]
+                                if key in full_state_dict:
+                                    state_dict[key] = full_state_dict[key]
 
                             state_dict =src.Utils.change_keys(state_dict, self.cut_layers, False)
                             src.Log.print_with_color(f"Load pretrain model successfully", "green")
@@ -240,16 +246,15 @@ class Server:
                             "message": "Server accept the connection!",
                             "parameters": copy.deepcopy(state_dict),
                             "cut_layers": self.cut_layers,
+                            "label_counts": self.label_counts,
                             "total_block": self.total_block,
-                            "model_name": self.model_name,
-                            "data_name": self.data_name,
-                            "num_sample": self.num_sample,
                             "control_count": self.control_count,
                             "batch_size": self.batch_size,
                             "lr": self.lr,
                             "weight_decay": self.weight_decay,
-                            "clip_grad_norm": self.clip_grad_norm,
-                            "fine_tune_config": self.fine_tune_config
+                            "fine_tune_config": self.fine_tune_config,
+                            "bottleneck_config": self.bottleneck_config,
+                            "quantization_config": self.quantization_config
                             }
                 self.send_to_response(client_id, pickle.dumps(response))
 

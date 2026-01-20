@@ -165,7 +165,7 @@ class BertClassifier(nn.Module):
 
 class Bert(nn.Module):
     def __init__( self, vocab_size=28996, hidden_size=768, num_attention_heads=12, intermediate_size=3072,
-        max_position_embeddings=512, type_vocab_size=2, dropout_prob=0.1, layer_id=0, n_block=12
+        max_position_embeddings=512, type_vocab_size=2, dropout_prob=0.1, layer_id=0, n_block=12, reduce_comm=False, bottleneck_dim=None
     ):
         super(Bert, self).__init__()
         self.layer_id = layer_id
@@ -179,6 +179,7 @@ class Bert(nn.Module):
             is_encoder_decoder=False, tie_word_embeddings=False,
             use_return_dict=True, output_attentions=False, output_hidden_states=False
         )
+        self.reduce_comm = reduce_comm
 
         if self.layer_id == 1:
             self.embeddings = BertEmbeddings(vocab_size=vocab_size, hidden_size=hidden_size, max_position_embeddings=max_position_embeddings,
@@ -187,7 +188,13 @@ class Bert(nn.Module):
                 [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
                  for _ in range(n_block)]
             )
+            if self.reduce_comm:
+                self.down = nn.Linear(hidden_size, bottleneck_dim, bias=False)
+                self.down_ln = nn.LayerNorm(bottleneck_dim)
+
         elif self.layer_id == 2:
+            if self.reduce_comm:
+                self.up = nn.Linear(bottleneck_dim, hidden_size, bias=False)
             self.layers = nn.ModuleList(
                 [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
                  for _ in range(n_block)]
@@ -203,6 +210,11 @@ class Bert(nn.Module):
                 [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
                  for _ in range(n_block)]
             )
+            if self.reduce_comm:
+                self.down = nn.Linear(hidden_size, bottleneck_dim, bias=False)
+                self.down_ln = nn.LayerNorm(bottleneck_dim)
+                self.up = nn.Linear(bottleneck_dim, hidden_size, bias=False)
+
             self.pooler = BertPooler(hidden_size)
             self.dropout = nn.Dropout(dropout_prob)
             self.classifier = nn.Linear(hidden_size, 4)
@@ -213,8 +225,12 @@ class Bert(nn.Module):
             x = self.embeddings(input_ids, token_type_ids)
             for encode in self.layers:
                 x = encode(x)
+            if self.reduce_comm:
+                return self.down_ln(self.down(x))
         elif self.layer_id == 2:
             x = input_ids
+            if self.reduce_comm:
+                x = self.up(x)
             for encode in self.layers:
                 x = encode(x)
             x = self.pooler(x)
@@ -222,8 +238,9 @@ class Bert(nn.Module):
             x = self.classifier(x)
         else:
             x = self.embeddings(input_ids, token_type_ids)
-            for encode in self.layers:
+            for i, encode in enumerate(self.layers):
                 x = encode(x)
+
             x = self.pooler(x)
             x = self.dropout(x)
             x = self.classifier(x)
