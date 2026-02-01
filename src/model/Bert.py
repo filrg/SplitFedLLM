@@ -189,12 +189,26 @@ class Bert(nn.Module):
                  for _ in range(n_block)]
             )
             if self.reduce_comm:
-                self.down = nn.Linear(hidden_size, bottleneck_dim, bias=False)
-                self.down_ln = nn.LayerNorm(bottleneck_dim)
+                self.encoder = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.LayerNorm(hidden_size // 2),
+                    nn.GELU(),
+
+                    nn.Linear(hidden_size // 2, bottleneck_dim),
+                    nn.LayerNorm(bottleneck_dim),
+                    nn.GELU(),
+                )
 
         elif self.layer_id == 2:
             if self.reduce_comm:
-                self.up = nn.Linear(bottleneck_dim, hidden_size, bias=False)
+                self.decoder = nn.Sequential(
+                    nn.Linear(bottleneck_dim, hidden_size // 2),
+                    nn.LayerNorm(hidden_size // 2),
+                    nn.GELU(),
+
+                    nn.Linear(hidden_size // 2, hidden_size),
+                    nn.LayerNorm(hidden_size),
+                )
             self.layers = nn.ModuleList(
                 [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
                  for _ in range(n_block)]
@@ -211,9 +225,23 @@ class Bert(nn.Module):
                  for _ in range(n_block)]
             )
             if self.reduce_comm:
-                self.down = nn.Linear(hidden_size, bottleneck_dim, bias=False)
-                self.down_ln = nn.LayerNorm(bottleneck_dim)
-                self.up = nn.Linear(bottleneck_dim, hidden_size, bias=False)
+                self.encoder = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.LayerNorm(hidden_size // 2),
+                    nn.GELU(),
+
+                    nn.Linear(hidden_size // 2, bottleneck_dim),
+                    nn.LayerNorm(bottleneck_dim),
+                    nn.GELU(),
+                )
+                self.decoder = nn.Sequential(
+                    nn.Linear(bottleneck_dim, hidden_size // 2),
+                    nn.LayerNorm(hidden_size // 2),
+                    nn.GELU(),
+
+                    nn.Linear(hidden_size // 2, hidden_size),
+                    nn.LayerNorm(hidden_size),
+                )
 
             self.pooler = BertPooler(hidden_size)
             self.dropout = nn.Dropout(dropout_prob)
@@ -226,11 +254,11 @@ class Bert(nn.Module):
             for encode in self.layers:
                 x = encode(x)
             if self.reduce_comm:
-                return self.down_ln(self.down(x))
+                return self.encoder(x)
         elif self.layer_id == 2:
             x = input_ids
             if self.reduce_comm:
-                x = self.up(x)
+                x = self.decoder(x)
             for encode in self.layers:
                 x = encode(x)
             x = self.pooler(x)

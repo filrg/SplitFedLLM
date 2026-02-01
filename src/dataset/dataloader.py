@@ -21,5 +21,5 @@ def dataloader(batch_size=None, distribution=None, train=True):
     else:
         test_texts, test_label = load_test_EMOTION(2000, dataset)
         test_set = EMOTIONDataset(test_texts, test_label, tokenizer, max_length=128)
-        test_loader = DataLoader(test_set, batch_size=100, shuffle=False)
+        test_loader = DataLoader(test_set, batch_size=25, shuffle=False)
         return test_loader

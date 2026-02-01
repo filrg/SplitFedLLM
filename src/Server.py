@@ -87,10 +87,15 @@ class Server:
 
     def distribution(self):
         if self.non_iid:
-            label_distribution = np.random.dirichlet([self.data_distribution["dirichlet"]["alpha"]] * self.num_label,
-                                                     self.total_clients[0])
-
+            # label_distribution = np.random.dirichlet([self.data_distribution["dirichlet"]["alpha"]] * self.num_label,
+            #                                          self.total_clients[0])
+            label_distribution = np.array([[0.05, 0.05, 0.05, 0.85],
+                                           [0.05, 0.05, 0.85, 0.05],
+                                           [0.05, 0.85, 0.05, 0.05],
+                                           [0.85, 0.05, 0.05, 0.05]
+                                           ])
             self.label_counts = (label_distribution * self.num_sample).astype(int)
+
         else:
             self.label_counts = np.full((self.total_clients[0], self.num_label), self.num_sample // self.num_label)
 
@@ -195,11 +200,14 @@ class Server:
 
         # Send message to clients when consumed all clients
         klass = Bert
+        stt = -1
 
         for (client_id, layer_id) in self.list_clients:
             # Read parameters file
             filepath = f'{self.model_name}.pt'
+            bottleneck_path = f'bottleneck.pt'
             state_dict = None
+            bottleneck_state_dict = None
 
             if start:
                 if self.load_parameters and register:
@@ -207,6 +215,7 @@ class Server:
                         full_state_dict = torch.load(filepath, weights_only=True)
 
                         if layer_id == 1:
+                            stt = stt + 1
                             if self.bottleneck_config["enable"]:
                                 model = klass(layer_id=1, n_block=self.cut_layers, reduce_comm=True,
                                               bottleneck_dim=self.bottleneck_config['bottleneck_dim'])
@@ -240,11 +249,18 @@ class Server:
                         src.Log.print_with_color(f"File {filepath} does not exist.", "yellow")
                         self.logger.log_info(f"File {filepath} does not exist.")
 
+                    if os.path.exists(bottleneck_path):
+                        bottleneck_state_dict = torch.load(bottleneck_path, weights_only=True, map_location=torch.device("cpu"))
+                        src.Log.print_with_color(f"Load pretrain bottleneck model", "green")
+                    else:
+                        src.Log.print_with_color(f"File {bottleneck_path} does not exist.", "yellow")
+
                 src.Log.print_with_color(f"[>>>] Sent start training request to client {client_id}", "red")
 
                 response = {"action": "START",
                             "message": "Server accept the connection!",
                             "parameters": copy.deepcopy(state_dict),
+                            "bottleneck": copy.deepcopy(bottleneck_state_dict),
                             "cut_layers": self.cut_layers,
                             "label_counts": self.label_counts,
                             "total_block": self.total_block,
@@ -254,8 +270,10 @@ class Server:
                             "weight_decay": self.weight_decay,
                             "fine_tune_config": self.fine_tune_config,
                             "bottleneck_config": self.bottleneck_config,
-                            "quantization_config": self.quantization_config
+                            "quantization_config": self.quantization_config,
+                            "stt" : stt
                             }
+
                 self.send_to_response(client_id, pickle.dumps(response))
 
 

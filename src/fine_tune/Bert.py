@@ -8,27 +8,6 @@ import torch.nn as nn
 
 import src.Log
 
-class QuantInt8STE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        # per-sample scale: shape [B,1,1]
-        with torch.no_grad():
-            # avoid zero scale
-            scale = x.abs().amax(dim=(1, 2), keepdim=True) / 127.0
-            scale = torch.clamp(scale, min=1e-8)
-            q = torch.clamp((x / scale).round(), -127, 127)
-            y = q * scale
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        # Straight-through estimator
-        return grad_out
-
-def qdq_int8_ste(x):
-    return QuantInt8STE.apply(x)
-
-
 class Ft_Bert:
     def __init__(self, client_id, layer_id, channel, device):
         self.client_id = client_id
@@ -85,7 +64,7 @@ class Ft_Bert:
                                    routing_key='rpc_queue',
                                    body=pickle.dumps(message))
 
-    def first_layer(self, model, lr, weight_decay, control_count=1, train_loader=None, quantization_config=None):
+    def first_layer(self, model, lr, weight_decay, control_count=1, train_loader=None, quantization_config=None, fine_tune_config=False):
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         backward_queue_name = f'gradient_queue_{self.layer_id}_{self.client_id}'
@@ -102,22 +81,24 @@ class Ft_Bert:
         with tqdm(total=len(train_loader), desc="Processing", unit="step") as pbar:
             while True:
                 # Training model
-                model.train()
-                optimizer.zero_grad()
+                if fine_tune_config:
+                    model.train()
+                    optimizer.zero_grad()
 
                 # Process gradient
                 method_frame, header_frame, body = self.channel.basic_get(queue=backward_queue_name, auto_ack=True)
                 if method_frame and body:
                     num_backward += 1
+
                     received_data = pickle.loads(body)
                     gradient_numpy = received_data["data"]
                     gradient = torch.tensor(gradient_numpy).to(self.device)
                     data_id = received_data["data_id"]
-
                     data_input = data_store.pop(data_id)
-                    output = model(input_ids=data_input)
-                    output.backward(gradient=gradient)
-                    optimizer.step()
+                    if fine_tune_config:
+                        output = model(input_ids=data_input)
+                        output.backward(gradient=gradient)
+                        optimizer.step()
                 else:
                     # speed control
                     if len(data_store) >= control_count:
@@ -131,8 +112,6 @@ class Ft_Bert:
                         data_store[data_id] = input_ids
 
                         intermediate_output = model(input_ids=input_ids)
-                        # if quantization_config['enable']:
-                        #     intermediate_output = qdq_int8_ste(intermediate_output)
                         intermediate_output = intermediate_output.detach().requires_grad_(True)
 
                         num_forward += 1

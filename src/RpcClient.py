@@ -44,6 +44,8 @@ class RpcClient:
             fine_tune_config = self.response['fine_tune_config']
             bottleneck_config =self.response['bottleneck_config']
             quantization_config = self.response['quantization_config']
+            bottleneck_state_dict = self.response["bottleneck"]
+            stt = self.response['stt']
 
             batch_size = self.response["batch_size"]
             lr = self.response["lr"]
@@ -59,51 +61,64 @@ class RpcClient:
                 target_modules=["query", "key", "value", "dense"])
             klass = Bert
             model = None
+            bottleneck_dict = {}
 
             if self.layer_id == 1:
                 if bottleneck_config["enable"]:
                     model = klass(layer_id=1, n_block=cut_layers, reduce_comm=True, bottleneck_dim=bottleneck_config['bottleneck_dim'])
+                    bottleneck_dict = {
+                        k: v
+                        for k, v in bottleneck_state_dict.items()
+                        if k.startswith("encoder.")
+                    }
+
                 else:
                     model = klass(layer_id=1, n_block=cut_layers)
             if self.layer_id == 2:
                 if bottleneck_config["enable"]:
                     model = klass(layer_id=2, n_block=total_block-cut_layers, reduce_comm=True, bottleneck_dim=bottleneck_config['bottleneck_dim'])
+                    bottleneck_dict = {
+                        k: v
+                        for k, v in bottleneck_state_dict.items()
+                        if k.startswith("decoder.")
+                    }
+
                 else:
                     model = klass(layer_id=2, n_block=total_block-cut_layers)
 
             # Read parameters and load to model
             if state_dict:
+                state_dict = {**state_dict, **bottleneck_dict}
                 model.load_state_dict(state_dict)
 
             if self.layer_id == 1:
                 if fine_tune_config['client']:
                     model = get_peft_model(model, peft_config)
-                    if bottleneck_config['enable']:
-                        for p in model.down.parameters():
-                            p.requires_grad = True
-                        for p in model.down_ln.parameters():
-                            p.requires_grad = True
+                    model.print_trainable_parameters()
+                else:
+                    for p in model.parameters():
+                        p.requires_grad = False
 
             if self.layer_id == 2:
                 if fine_tune_config['server']:
                     model = get_peft_model(model, peft_config)
-                    for param in model.classifier.parameters():
-                        param.requires_grad = True
-                    if bottleneck_config['enable']:
-                        for p in model.up.parameters():
-                            p.requires_grad = True
-
-            model.print_trainable_parameters()
+                    model.print_trainable_parameters()
+                else:
+                    for p in model.parameters():
+                        p.requires_grad = False
+                for param in model.classifier.parameters():
+                    param.requires_grad = True
 
             model.to(self.device)
 
             # Start training
             if self.layer_id == 1:
                 if self.train_loader is None:
-                    self.train_loader = dataloader(batch_size, label_counts[0], train=True)
+                    src.Log.print_with_color(f"Label: {label_counts[stt]}", 'yellow')
+                    self.train_loader = dataloader(batch_size, label_counts[stt], train=True)
 
                 result, size = self.model_train.first_layer(model, lr, weight_decay,
-                                                                         control_count, self.train_loader, quantization_config)
+                                                                         control_count, self.train_loader, quantization_config, fine_tune_config["client"])
             else:
                 result, size = self.model_train.last_layer(model, lr, weight_decay, quantization_config)
 
