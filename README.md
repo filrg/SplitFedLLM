@@ -14,13 +14,9 @@ server:
     - 1
     - 1
   cut-layers: 4
-  model-name: Bert # GPT2/Llama/Bert
-  data-name: EMOTION # EMOTION/GSM8K
+  model-name: Bert
+  data-name: EMOTION
   model:
-    GPT2:
-      n_block: 12
-    Llama:
-      n_block: 12
     Bert:
       n_block: 12
   parameters:
@@ -29,8 +25,8 @@ server:
   validation: True
   data-distribution:
     non-iid: False
-    num-sample: 500
-    num-label: 10
+    num-sample: 400
+    num-label: 4
     dirichlet:
       alpha: 1
     refresh-each-round: True
@@ -53,10 +49,19 @@ learning:
   clip-grad-norm: 0.0
 
 fine-tune:
-  name: LoRA
+  client: False
+  server: False
   LoRA:
     r: 8
     alpha: 16
+
+bottleneck:
+  enable: True
+  bottleneck_dim: 128
+
+quantization:
+  enable: True
+
 ```
 ## How to Run
 ### Server
