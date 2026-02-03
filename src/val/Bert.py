@@ -11,13 +11,17 @@ def val_Bert(state_dict_full, cut_layers , bottleneck_config, logger):
 
     test_loader = dataloader(train=False)
     if bottleneck_config['enable']:
-        client = Bert(layer_id=1, n_block=cut_layers, reduce_comm=True,
-                                              bottleneck_dim=bottleneck_config['bottleneck_dim'])
-        client.load_state_dict(state_dict_full[0])
+        client = Bert(layer_id=1, n_block=cut_layers)
+        client_state_dict = client.state_dict()
+        for key in client_state_dict:
+            client_state_dict[key] = state_dict_full[0][key]
+        client.load_state_dict(client_state_dict)
         client = client.to(device)
-        server = Bert(layer_id=2, n_block=12 - cut_layers, reduce_comm=True,
-                                              bottleneck_dim=bottleneck_config['bottleneck_dim'])
-        server.load_state_dict(state_dict_full[1])
+        server = Bert(layer_id=2, n_block=12 - cut_layers)
+        server_state_dict = server.state_dict()
+        for key in server_state_dict:
+            server_state_dict[key] = state_dict_full[1][key]
+        server.load_state_dict(server_state_dict)
         server = server.to(device)
     else:
         client = Bert(layer_id=1, n_block=cut_layers)
