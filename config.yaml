@@ -50,5 +50,3 @@ bottleneck:
   enable: True
   bottleneck_dim: 128
 
-quantization:
-  enable: True

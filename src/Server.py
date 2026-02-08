@@ -1,5 +1,6 @@
 import torch
 import os
+import time
 import random
 import pika
 import pickle
@@ -52,7 +53,6 @@ class Server:
 
         # Bottleneck + Quantization
         self.bottleneck_config = config['bottleneck']
-        self.quantization_config = config['quantization']
 
         if self.random_seed:
             random.seed(self.random_seed)
@@ -215,7 +215,6 @@ class Server:
                         full_state_dict = torch.load(filepath, weights_only=True)
 
                         if layer_id == 1:
-                            stt = stt + 1
                             if self.bottleneck_config["enable"]:
                                 model = klass(layer_id=1, n_block=self.cut_layers, reduce_comm=True,
                                               bottleneck_dim=self.bottleneck_config['bottleneck_dim'])
@@ -262,16 +261,9 @@ class Server:
                             "parameters": copy.deepcopy(state_dict),
                             "bottleneck": copy.deepcopy(bottleneck_state_dict),
                             "cut_layers": self.cut_layers,
-                            "label_counts": self.label_counts,
                             "total_block": self.total_block,
-                            "control_count": self.control_count,
-                            "batch_size": self.batch_size,
-                            "lr": self.lr,
-                            "weight_decay": self.weight_decay,
                             "fine_tune_config": self.fine_tune_config,
                             "bottleneck_config": self.bottleneck_config,
-                            "quantization_config": self.quantization_config,
-                            "stt" : stt
                             }
 
                 self.send_to_response(client_id, pickle.dumps(response))
@@ -280,10 +272,25 @@ class Server:
             else:
                 src.Log.print_with_color(f"[>>>] Sent stop training request to client {client_id}", "red")
                 response = {"action": "STOP",
-                            "message": "Stop training!",
-                            "parameters": None}
+                            "message": "Stop training!"
+                            }
                 self.send_to_response(client_id, pickle.dumps(response))
 
+        time.sleep(5)
+        if start:
+            for (client_id, layer_id) in self.list_clients:
+                if layer_id == 1:
+                    stt += 1
+                response = {"action": "SYN",
+                            "label_counts": self.label_counts,
+                            "control_count": self.control_count,
+                            "batch_size": self.batch_size,
+                            "lr": self.lr,
+                            "weight_decay": self.weight_decay,
+                            "stt": stt,
+                            "message": "Synchronize client devices",
+                            }
+                self.send_to_response(client_id, pickle.dumps(response))
 
     def start(self):
         self.channel.start_consuming()

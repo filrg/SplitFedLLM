@@ -64,7 +64,7 @@ class Ft_Bert:
                                    routing_key='rpc_queue',
                                    body=pickle.dumps(message))
 
-    def first_layer(self, model, lr, weight_decay, control_count=1, train_loader=None, quantization_config=None, fine_tune_config=False):
+    def first_layer(self, model, lr, weight_decay, control_count=1, train_loader=None, fine_tune_config=False):
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         backward_queue_name = f'gradient_queue_{self.layer_id}_{self.client_id}'
@@ -143,7 +143,7 @@ class Ft_Bert:
                     return True, self.data_count
             time.sleep(0.5)
 
-    def last_layer(self, model, lr, weight_decay, quantization_config=None):
+    def last_layer(self, model, lr, weight_decay):
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         criterion = nn.CrossEntropyLoss()
         result = True
@@ -199,15 +199,4 @@ class Ft_Bert:
 
     def alone_training(self, model, lr, momentum, clip_grad_norm, train_loader=None, cluster=None):
         pass
-
-
-
-
-
-
-
-
-
-
-
 

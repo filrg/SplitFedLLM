@@ -17,6 +17,8 @@ class RpcClient:
         self.model_train = None
         self.train_loader = None
         self.device = device
+        self.fine_tune_config = None
+        self.model = None
 
         self.response = None
         self.label_count = None
@@ -35,37 +37,31 @@ class RpcClient:
         self.response = pickle.loads(body)
         src.Log.print_with_color(f"[<<<] Client received: {self.response['message']}", "blue")
         action = self.response["action"]
-        state_dict = self.response["parameters"]
 
         if action == "START":
+            state_dict = self.response["parameters"]
             cut_layers = self.response['cut_layers']
-            label_counts = self.response['label_counts']
             total_block = self.response['total_block']
-            fine_tune_config = self.response['fine_tune_config']
+            self.fine_tune_config = self.response['fine_tune_config']
             bottleneck_config =self.response['bottleneck_config']
-            quantization_config = self.response['quantization_config']
             bottleneck_state_dict = self.response["bottleneck"]
-            stt = self.response['stt']
 
-            batch_size = self.response["batch_size"]
-            lr = self.response["lr"]
-            weight_decay = self.response["weight_decay"]
-            control_count = self.response["control_count"]
 
             self.model_train = Ft_Bert(self.client_id, self.layer_id, self.channel, self.device)
 
             peft_config = LoraConfig(
                 task_type="SEQ_CLS",
-                r=fine_tune_config['LoRA']['r'], lora_alpha=fine_tune_config['LoRA']['alpha'], lora_dropout=0.1,
+                r=self.fine_tune_config['LoRA']['r'], lora_alpha=self.fine_tune_config['LoRA']['alpha'], lora_dropout=0.1,
                 bias="none",
                 target_modules=["query", "key", "value", "dense"])
             klass = Bert
-            model = None
+            self.model = None
             bottleneck_dict = {}
 
             if self.layer_id == 1:
                 if bottleneck_config["enable"]:
-                    model = klass(layer_id=1, n_block=cut_layers, reduce_comm=True, bottleneck_dim=bottleneck_config['bottleneck_dim'])
+                    self.model = klass(layer_id=1, n_block=cut_layers, reduce_comm=True,
+                                  bottleneck_dim=bottleneck_config['bottleneck_dim'])
                     bottleneck_dict = {
                         k: v
                         for k, v in bottleneck_state_dict.items()
@@ -73,10 +69,11 @@ class RpcClient:
                     }
 
                 else:
-                    model = klass(layer_id=1, n_block=cut_layers)
+                    self.model = klass(layer_id=1, n_block=cut_layers)
             if self.layer_id == 2:
                 if bottleneck_config["enable"]:
-                    model = klass(layer_id=2, n_block=total_block-cut_layers, reduce_comm=True, bottleneck_dim=bottleneck_config['bottleneck_dim'])
+                    self.model = klass(layer_id=2, n_block=total_block - cut_layers, reduce_comm=True,
+                                  bottleneck_dim=bottleneck_config['bottleneck_dim'])
                     bottleneck_dict = {
                         k: v
                         for k, v in bottleneck_state_dict.items()
@@ -84,32 +81,40 @@ class RpcClient:
                     }
 
                 else:
-                    model = klass(layer_id=2, n_block=total_block-cut_layers)
+                    self.model = klass(layer_id=2, n_block=total_block - cut_layers)
 
             # Read parameters and load to model
             if state_dict:
                 state_dict = {**state_dict, **bottleneck_dict}
-                model.load_state_dict(state_dict)
+                self.model.load_state_dict(state_dict)
 
             if self.layer_id == 1:
-                if fine_tune_config['client']:
-                    model = get_peft_model(model, peft_config)
-                    model.print_trainable_parameters()
+                if self.fine_tune_config['client']:
+                    self.model = get_peft_model(self.model, peft_config)
+                    self.model.print_trainable_parameters()
                 else:
-                    for p in model.parameters():
+                    for p in self.model.parameters():
                         p.requires_grad = False
 
             if self.layer_id == 2:
-                if fine_tune_config['server']:
-                    model = get_peft_model(model, peft_config)
-                    model.print_trainable_parameters()
+                if self.fine_tune_config['server']:
+                    self.model = get_peft_model(self.model, peft_config)
+                    self.model.print_trainable_parameters()
                 else:
-                    for p in model.parameters():
+                    for p in self.model.parameters():
                         p.requires_grad = False
-                for param in model.classifier.parameters():
+                for param in self.model.classifier.parameters():
                     param.requires_grad = True
 
-            model.to(self.device)
+            return True
+
+        elif action == "SYN":
+            label_counts = self.response['label_counts']
+            stt = self.response['stt']
+            batch_size = self.response["batch_size"]
+            lr = self.response["lr"]
+            weight_decay = self.response["weight_decay"]
+            control_count = self.response["control_count"]
 
             # Start training
             if self.layer_id == 1:
@@ -117,20 +122,21 @@ class RpcClient:
                     src.Log.print_with_color(f"Label: {label_counts[stt]}", 'yellow')
                     self.train_loader = dataloader(batch_size, label_counts[stt], train=True)
 
-                result, size = self.model_train.first_layer(model, lr, weight_decay,
-                                                                         control_count, self.train_loader, quantization_config, fine_tune_config["client"])
+                result, size = self.model_train.first_layer(self.model, lr, weight_decay,
+                                                            control_count, self.train_loader,
+                                                            self.fine_tune_config["client"])
             else:
-                result, size = self.model_train.last_layer(model, lr, weight_decay, quantization_config)
+                result, size = self.model_train.last_layer(self.model, lr, weight_decay)
 
             # Stop training, then send parameters to server
             if self.layer_id == 1:
-                if fine_tune_config['client']:
-                    model = model.merge_and_unload()
+                if self.fine_tune_config['client']:
+                    self.model = self.model.merge_and_unload()
             else:
-                if fine_tune_config['server']:
-                    model = model.merge_and_unload()
+                if self.fine_tune_config['server']:
+                    self.model = self.model.merge_and_unload()
 
-            model_state_dict = copy.deepcopy(model.state_dict())
+            model_state_dict = copy.deepcopy(self.model.state_dict())
 
             if self.device != "cpu":
                 for key in model_state_dict:
@@ -141,6 +147,7 @@ class RpcClient:
             src.Log.print_with_color("[>>>] Client sent parameters to server", "red")
             self.send_to_server(data)
             return True
+
         elif action == "STOP":
             return False
 
