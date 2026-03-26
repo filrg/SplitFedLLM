@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import math
+from src.Optimizer import flash_scaled_dot_product
 
 class DotDict(dict):
     def __getattr__(self, k):
@@ -35,7 +36,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_rot, k_rot
 
 def build_causal_mask(B, T, device):
-    return torch.ones(T, T, device=device).tril().unsqueeze(0).unsqueeze(1).expand(B, 1, T, T)
+    return torch.ones(T, T, device=device).tril().unsqueeze(0).unsqueeze(1).expand(B, 1, T, T).contiguous()
 
 class LlamaRotaryEmbedding(nn.Module):
     def __init__(
@@ -62,17 +63,19 @@ class LlamaRotaryEmbedding(nn.Module):
         self._set_cos_sin_cache(max_position_embeddings, dtype=torch.float32, device=device)
 
     def _set_cos_sin_cache(self, seq_len: int, dtype: torch.dtype, device=None):
+        # Fix Bug 12: khi device=None (gọi lại từ forward), dùng inv_freq.device
         device = device if device is not None else self.inv_freq.device
 
-        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)  # [seq_len]
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freq = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat([freq, freq], dim=-1)
 
         cos = emb.cos()[None, None, :, :]  # [1, 1, seq_len, dim]
-        sin = emb.sin()[None, None, :, :]  # [1, 1, seq_len, dim]
+        sin = emb.sin()[None, None, :, :]
 
-        self.cos_cached = cos.to(dtype=dtype, device=device)
-        self.sin_cached = sin.to(dtype=dtype, device=device)
+        # Lưu FP32 rồi cast khi dùng để tránh precision mismatch
+        self.cos_cached = cos.to(dtype=torch.float32, device=device)
+        self.sin_cached = sin.to(dtype=torch.float32, device=device)
         self.max_seq_len_cached = seq_len
 
     def forward(self, x, seq_len: int = None):
@@ -80,19 +83,22 @@ class LlamaRotaryEmbedding(nn.Module):
             seq_len = x.shape[-2]
 
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len, dtype=x.dtype, device=x.device)
+            self._set_cos_sin_cache(seq_len, dtype=torch.float32, device=x.device)
 
+        # Cast về dtype và device của x tại thời điểm dùng (hỗ trợ FP16/BF16)
         cos = self.cos_cached[:, :, :seq_len, :].to(dtype=x.dtype, device=x.device)
         sin = self.sin_cached[:, :, :seq_len, :].to(dtype=x.dtype, device=x.device)
         return cos, sin
 
 class LlamaAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, num_kv_heads, dropout=0.0, head_dim=64):
+    def __init__(self, hidden_size, num_heads, num_kv_heads, dropout=0.0, head_dim=64,
+                 use_flash=False):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.use_flash = use_flash
 
         self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
@@ -101,6 +107,7 @@ class LlamaAttention(nn.Module):
 
         self.rope = LlamaRotaryEmbedding(head_dim)
         self.dropout = nn.Dropout(dropout)
+        self._dropout_p = dropout
 
     def forward(self, x, attention_mask=None):
         B, T, C = x.size()
@@ -116,17 +123,9 @@ class LlamaAttention(nn.Module):
             k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
             v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
 
-        att = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        dp = self._dropout_p if self.training else 0.0
+        out = flash_scaled_dot_product(q, k, v, mask=attention_mask, dropout_p=dp)
 
-        if attention_mask is not None:
-            att = att.masked_fill(
-                attention_mask == 0,
-                torch.finfo(att.dtype).min
-            )
-
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        out = att @ v
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(out)
 
@@ -143,10 +142,12 @@ class LlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, num_kv_heads, intermediate_size, rms_eps=1e-6):
+    def __init__(self, hidden_size, num_heads, num_kv_heads, intermediate_size,
+                 rms_eps=1e-6, use_flash=False):
         super().__init__()
         self.input_layernorm  = LlamaRMSNorm(hidden_size, eps=rms_eps)
-        self.self_attn = LlamaAttention(hidden_size, num_heads, num_kv_heads)
+        self.self_attn = LlamaAttention(hidden_size, num_heads, num_kv_heads,
+                                        use_flash=use_flash)
         self.post_attention_layernorm  = LlamaRMSNorm(hidden_size, eps=rms_eps)
         self.mlp = LlamaMLP(hidden_size, intermediate_size)
 
@@ -159,9 +160,10 @@ class LlamaDecoderLayer(nn.Module):
 class Llama(nn.Module):
     def __init__(self, vocab_size=32000, hidden_size=768, intermediate_size=3072, num_attention_heads=12,
                  num_key_value_heads=12,
-                 layer_id=0, n_block=12):
+                 layer_id=0, n_block=12, use_flash=False):
         super().__init__()
         self.layer_id = layer_id
+        self.use_flash = use_flash
         self.config = DotDict(
             model_type="llama",
             vocab_size=vocab_size,
@@ -181,25 +183,25 @@ class Llama(nn.Module):
             use_cache=True,
             torch_dtype="float32",
         )
+
+        def _make_layers(n):
+            return nn.ModuleList([
+                LlamaDecoderLayer(hidden_size, num_attention_heads,
+                                  num_key_value_heads, intermediate_size,
+                                  use_flash=use_flash)
+                for _ in range(n)
+            ])
+
         if self.layer_id == 1:
             self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
-            self.layers = nn.ModuleList([
-                LlamaDecoderLayer(hidden_size, num_attention_heads, num_key_value_heads, intermediate_size) for _ in
-                range(n_block)
-            ])
+            self.layers = _make_layers(n_block)
         elif self.layer_id == 2:
-            self.layers = nn.ModuleList([
-                LlamaDecoderLayer(hidden_size, num_attention_heads, num_key_value_heads, intermediate_size) for _ in
-                range(n_block)
-            ])
+            self.layers = _make_layers(n_block)
             self.norm = LlamaRMSNorm(hidden_size)
             self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         else:
             self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
-            self.layers = nn.ModuleList([
-                LlamaDecoderLayer(hidden_size, num_attention_heads, num_key_value_heads, intermediate_size) for _ in
-                range(n_block)
-            ])
+            self.layers = _make_layers(n_block)
             self.norm = LlamaRMSNorm(hidden_size)
             self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
@@ -208,7 +210,9 @@ class Llama(nn.Module):
             B, T = input_ids.shape
             x = self.embed_tokens(input_ids)
 
-            masks = build_causal_mask(B, T, attention_mask.device)
+            # Fix: dùng input_ids.device làm fallback khi attention_mask là None
+            ref_device = attention_mask.device if attention_mask is not None else input_ids.device
+            masks = build_causal_mask(B, T, ref_device)
             if attention_mask is not None:
                 key_mask = attention_mask[:, None, None, :].to(masks.dtype)
                 qry_mask = attention_mask[:, None, :, None].to(masks.dtype)
@@ -229,7 +233,8 @@ class Llama(nn.Module):
             B, T = input_ids.shape
             x = self.embed_tokens(input_ids)
 
-            masks = build_causal_mask(B, T, attention_mask.device)
+            ref_device = attention_mask.device if attention_mask is not None else input_ids.device
+            masks = build_causal_mask(B, T, ref_device)
             if attention_mask is not None:
                 key_mask = attention_mask[:, None, None, :].to(masks.dtype)
                 qry_mask = attention_mask[:, None, :, None].to(masks.dtype)
@@ -246,11 +251,4 @@ class Llama(nn.Module):
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
         B, T = input_ids.shape
         device = input_ids.device
-        causal = torch.ones(T, T, device=device).tril().unsqueeze(0).unsqueeze(1).expand(B, 1, T, T)
-        if attention_mask is not None:
-            key_mask = attention_mask[:, None, None, :].to(causal.dtype)
-            qry_mask = attention_mask[:, None, :, None].to(causal.dtype)
-            masks = causal * key_mask * qry_mask
-        else:
-            masks = causal
-        return {"input_ids": input_ids, "attention_mask": masks, **kwargs}
+        causal = torch.ones(T, T, device=device).tril().unsqueeze(0).unsqueeze(1).expand(B, 1, T, T).contiguous()

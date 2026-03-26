@@ -1,3 +1,6 @@
+from src.model.GPT2 import GPT2
+from src.model.Llama import Llama
+from src.model.Bert import Bert
 import torch
 import os
 import random
@@ -5,301 +8,332 @@ import pika
 import pickle
 import sys
 import numpy as np
-import copy
 import src.Log
 import src.Utils
-
-from src.model.GPT2 import GPT2
-from src.model.Llama import Llama
-from src.model.Bert import Bert
 from src.val.get_val import get_val
+
 
 class Server:
     def __init__(self, config):
-        # RabbitMQ
-        address = config["rabbit"]["address"]
-        username = config["rabbit"]["username"]
-        password = config["rabbit"]["password"]
+        address      = config["rabbit"]["address"]
+        username     = config["rabbit"]["username"]
+        password     = config["rabbit"]["password"]
         virtual_host = config["rabbit"]["virtual-host"]
 
-        self.model_name = config["server"]["model-name"]
-        self.data_name = config["server"]["data-name"]
-        self.total_clients = config["server"]["clients"]
-        self.cut_layers = config["server"]["cut-layers"]
-        self.global_round = config["server"]["global-round"]
-        self.round = self.global_round
+        self.model_name      = config["server"]["model-name"]
+        self.data_name       = config["server"]["data-name"]
+        self.total_clients   = config["server"]["clients"]
+        self.cut_layers      = config["server"]["cut-layers"]
+        self.global_round    = config["server"]["global-round"]
+        self.round           = self.global_round
         self.save_parameters = config["server"]["parameters"]["save"]
         self.load_parameters = config["server"]["parameters"]["load"]
-        self.validation = config["server"]["validation"]
+        self.validation      = config["server"]["validation"]
 
-        # Clients
-        self.total_block = config["server"]["model"][self.model_name]["n_block"]
-        self.batch_size = config["learning"]["batch-size"]
-        self.lr = config["learning"]["learning-rate"]
-        self.weight_decay = config["learning"]["weight-decay"]
-        self.control_count = config["learning"]["control-count"]
-        self.clip_grad_norm = config["learning"]["clip-grad-norm"]
+        self.total_block     = config["server"]["model"][self.model_name]["n_block"]
+        self.batch_size      = config["learning"]["batch-size"]
+        self.lr              = config["learning"]["learning-rate"]
+        self.weight_decay    = config["learning"]["weight-decay"]
+        self.control_count   = config["learning"]["control-count"]
+        self.clip_grad_norm  = config["learning"]["clip-grad-norm"]
         self.data_distribution = config["server"]["data-distribution"]
 
-        # Data distribution
-        self.non_iid = self.data_distribution["non-iid"]
-        self.num_label = self.data_distribution["num-label"]
-        self.num_sample = self.data_distribution["num-sample"]
-        self.refresh_each_round = self.data_distribution["refresh-each-round"]
-        self.random_seed = config["server"]["random-seed"]
-        self.label_counts = None
+        self.non_iid           = self.data_distribution["non-iid"]
+        self.num_label         = self.data_distribution["num-label"]
+        self.num_sample        = self.data_distribution["num-sample"]
+        self.refresh_each_round = self.data_distribution.get("refresh-each-round", False)
+        self.random_seed       = config["server"].get("random-seed", 1)
 
-        # Fine tune config
-        self.fine_tune_config = config['fine-tune']
+        self.fine_tune_config = config["fine-tune"]
+        self.opt_config       = config.get("optimization", {})
+        self.config           = config
+
+        self.model_params = {
+            "vocab_size":      config["server"].get("vocab_size", 50257),
+            "n_embd":          config["server"].get("n_embd", 768),
+            "n_layer":         config["server"].get("n_layer", 12),
+            "n_head":          config["server"].get("n_head", 12),
+            "pretrained_path": config["server"].get("pretrained_path", f"{self.model_name}.pt"),
+        }
 
         if self.random_seed:
             random.seed(self.random_seed)
 
-        log_path = config["log_path"]
-
+        log_path    = config["log_path"]
         credentials = pika.PlainCredentials(username, password)
         self.connection = pika.BlockingConnection(
-            pika.ConnectionParameters(address, 5672, f'{virtual_host}', credentials))
+            pika.ConnectionParameters(
+                host=address, port=5672,
+                virtual_host=f"{virtual_host}",
+                credentials=credentials,
+                heartbeat=0,
+                blocked_connection_timeout=None,
+            )
+        )
         self.channel = self.connection.channel()
-        self.channel.queue_declare(queue='rpc_queue')
+        self.channel.queue_declare(queue="rpc_queue")
 
-        self.count_update = [0 for _ in range(len(self.total_clients))]
+        self.count_notify     = 0
+        self.count_ready      = 0  
         self.register_clients = [0 for _ in range(len(self.total_clients))]
-        self.count_notify = 0
-        self.responses = {}
-        self.list_clients = []
-        self.round_result = True
-
-        self.global_model_parameters = [[] for _ in range(len(self.total_clients))]
-        self.global_client_sizes = [[] for _ in range(len(self.total_clients))]
-        self.avg_state_dict = []
+        self.responses        = {}
+        self.list_clients     = []
+        self.round_result     = True
 
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
-        self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
+        self.channel.basic_consume(queue="rpc_queue", on_message_callback=self.on_request)
 
         debug_mode = config["debug_mode"]
         self.logger = src.Log.Logger(f"{log_path}/app.log", debug_mode)
-        self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
-        src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
+        self.logger.log_info(
+            f"Application start. Server waiting for {self.total_clients} clients."
+        )
+        src.Log.print_with_color(
+            f"Application start. Server waiting for {self.total_clients} clients.", "green"
+        )
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def distribution(self):
+        num_clients = sum(self.total_clients)
         if self.non_iid:
-            label_distribution = np.random.dirichlet([self.data_distribution["dirichlet"]["alpha"]] * self.num_label,
-                                                     self.total_clients[0])
-
-            self.label_counts = (label_distribution * self.num_sample).astype(int)
+            label_dist = np.random.dirichlet(
+                [self.data_distribution["dirichlet"]["alpha"]] * self.num_label,
+                num_clients
+            )
+            self.label_counts = (label_dist * self.num_sample).astype(int)
         else:
-            self.label_counts = np.full((self.total_clients[0], self.num_label), self.num_sample // self.num_label)
+            self.label_counts = np.full(
+                (num_clients, self.num_label),
+                self.num_sample // self.num_label
+            )
+
+    # ── Main handler ──────────────────────────────────────────────────────────
 
     def on_request(self, ch, method, props, body):
-        message = pickle.loads(body)
-        routing_key = props.reply_to
-        action = message["action"]
+        message   = pickle.loads(body)
+        action    = message["action"]
         client_id = message["client_id"]
-        layer_id = message["layer_id"]
-        self.responses[routing_key] = message
+        layer_id  = message["layer_id"]
 
+        # ── REGISTER ──────────────────────────────────────────────────────────
         if action == "REGISTER":
             if (str(client_id), layer_id) not in self.list_clients:
                 self.list_clients.append((str(client_id), layer_id))
 
-            src.Log.print_with_color(f"[<<<] Received message from client: {message}", "blue")
-            # Save messages from clients
+            src.Log.print_with_color(
+                f"[<<<] REGISTER from client {client_id} layer {layer_id}", "blue"
+            )
             self.register_clients[layer_id - 1] += 1
 
-            # If consumed all clients - Register for first time
-            if self.register_clients == self.total_clients:
-                src.Log.print_with_color("All clients are connected. Sending notifications.", "green")
-
+            if all(
+                self.register_clients[i] >= self.total_clients[i]
+                for i in range(len(self.total_clients))
+            ):
+                src.Log.print_with_color("All clients connected. Starting round 1.", "green")
                 self.distribution()
-
-                self.logger.log_info(f"Start training round 1")
+                self.logger.log_info("Start training round 1")
                 self.notify_clients()
 
-        elif action == "NOTIFY":
-            src.Log.print_with_color(f"[<<<] Received message from client: {message}", "blue")
-            message = {"action": "PAUSE",
-                       "message": "Pause training and please send your parameters",
-                       "parameters": None}
 
+        # Client báo hoàn thành train. Server gửi PAUSE để client biết có thể lưu LoRA.
+        elif action == "NOTIFY":
+            src.Log.print_with_color(
+                f"[<<<] NOTIFY from client {client_id} layer {layer_id}", "blue"
+            )
             self.count_notify += 1
 
-            if self.count_notify == self.total_clients[0]:
+            if self.count_notify == sum(self.total_clients):
                 self.count_notify = 0
-                src.Log.print_with_color(f"Received all the finish training notification", "yellow")
+                current_round     = self.global_round - self.round + 1
+                src.Log.print_with_color(
+                    f"All clients finished training round {current_round}.", "yellow"
+                )
 
-                for (client_id, layer_id) in self.list_clients:
-                    self.send_to_response(client_id, pickle.dumps(message))
+                # Gửi PAUSE → client nhận xong mới lưu LoRA rồi gửi READY
+                pause_msg = {
+                    "action":        "PAUSE",
+                    "message":       f"Round {current_round} done. Save your LoRA.",
+                    "current_round": current_round,
+                    "parameters":    None,
+                }
+                for (cid, lid) in self.list_clients:
+                    self.send_to_response(cid, pickle.dumps(pause_msg))
 
-        elif action == "UPDATE":
-            # self.distribution()
-            data_message = message["message"]
-            result = message["result"]
-            src.Log.print_with_color(f"[<<<] Received message from {client_id}: {data_message}", "blue")
+                self.logger.log_info(f"Round {current_round} complete. Waiting for READY.")
 
-            self.count_update[layer_id - 1] += 1
-            if not result:
-                self.round_result = False
+        # Server chỉ gửi START round tiếp khi đủ tất cả READY.
+        elif action == "READY":
+            src.Log.print_with_color(
+                f"[<<<] READY from client {client_id} layer {layer_id}", "blue"
+            )
+            self.count_ready += 1
 
-            # Save client's model parameters
-            if self.save_parameters and self.round_result:
-                model_state_dict = message["parameters"]
-                client_size = message["size"]
-                self.global_model_parameters[layer_id - 1].append(model_state_dict)
-                self.global_client_sizes[layer_id - 1].append(client_size)
+            if self.count_ready == sum(self.total_clients):
+                self.count_ready  = 0
+                self.round       -= 1
+                current_round     = self.global_round - self.round
 
-            # If consumed all client's parameters
-            if self.count_update == self.total_clients:
-                src.Log.print_with_color("Collected all parameters.", "yellow")
-                if self.save_parameters and self.round_result:
+                src.Log.print_with_color(
+                    f"All clients ready. Round {current_round} fully complete.", "green"
+                )
+                self.logger.log_info(f"Round {current_round} fully complete.")
 
-                    self.avg_all_parameters()
-                    self.global_model_parameters = [[] for _ in range(len(self.total_clients))]
-                    self.global_client_sizes = [[] for _ in range(len(self.total_clients))]
-
-                self.count_update = [0 for _ in range(len(self.total_clients))]
-                # Test
-                if self.save_parameters and self.validation and self.round_result:
-                    state_dict_full = self.concatenate()
-                    self.avg_state_dict = []
-                    if not get_val(self.model_name, self.data_name, state_dict_full,self.logger):
-                        self.logger.log_warning("Training failed!")
-                    else:
-                        # Save to files
-                        torch.save(state_dict_full, f'{self.model_name}.pt')
-                        self.round -= 1
-                else:
-                    self.round -= 1
-
-                # Start a new training round
-                self.round_result = True
+                # Merge GPT2_layer1.pt + GPT2_layer2.pt → GPT2.pt
+                self._merge_layer_files()
 
                 if self.round > 0:
-                    self.logger.log_info(f"Start training round {self.global_round - self.round + 1}")
-                    if self.save_parameters:
-                        self.notify_clients()
-                    else:
-                        self.notify_clients(register=False)
+                    next_round = self.global_round - self.round + 1
+                    self.logger.log_info(f"Start training round {next_round}")
+                    self.notify_clients()
                 else:
                     self.logger.log_info("Stop training !!!")
                     self.notify_clients(start=False)
                     sys.exit()
 
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        elif action == "UPDATE":
+            src.Log.print_with_color(
+                f"[WARN] Deprecated UPDATE from client {client_id} — ignored.", "yellow"
+            )
 
-    def notify_clients(self, start=True, register=True):
+        try:
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+        except Exception as e:
+            src.Log.print_with_color(f"[WARN] basic_ack failed: {e}", "yellow")
+            self._reconnect()
 
-        # Send message to clients when consumed all clients
-        if self.model_name == 'GPT2':
-            klass = GPT2
-        elif self.model_name == 'Llama':
-            klass = Llama
-        elif self.model_name == 'Bert':
-            klass = Bert
-        else:
-            klass = globals()[f'{self.model_name}']
 
+    def notify_clients(self, start=True):
         for (client_id, layer_id) in self.list_clients:
-            # Read parameters file
-            filepath = f'{self.model_name}.pt'
-            state_dict = None
+            if not start:
+                self.send_to_response(
+                    client_id,
+                    pickle.dumps({"action": "STOP", "message": "Stop training!", "parameters": None})
+                )
+                src.Log.print_with_color(f"[>>>] STOP → client {client_id}", "red")
+                continue
 
-            if start:
-                if self.load_parameters and register:
-                    if os.path.exists(filepath):
-                        full_state_dict = torch.load(filepath, weights_only=True)
-
-                        if layer_id == 1:
-                            model = klass(layer_id=1, n_block=self.cut_layers)
-                            state_dict = model.state_dict()
-                            keys = state_dict.keys()
-
-                            for key in keys:
-                                state_dict[key] = full_state_dict[key]
-
-                        else:
-                            model = klass(layer_id=2, n_block=self.total_block - self.cut_layers)
-                            state_dict = model.state_dict()
-                            state_dict = src.Utils.change_keys(state_dict, self.cut_layers, True)
-                            keys = state_dict.keys()
-
-                            for key in keys:
-                                state_dict[key] = full_state_dict[key]
-
-                            state_dict =src.Utils.change_keys(state_dict, self.cut_layers, False)
-                            src.Log.print_with_color(f"Load pretrain model successfully", "green")
-
-                    else:
-                        src.Log.print_with_color(f"File {filepath} does not exist.", "yellow")
-                        self.logger.log_info(f"File {filepath} does not exist.")
-
-                src.Log.print_with_color(f"[>>>] Sent start training request to client {client_id}", "red")
-
-                response = {"action": "START",
-                            "message": "Server accept the connection!",
-                            "parameters": copy.deepcopy(state_dict),
-                            "cut_layers": self.cut_layers,
-                            "total_block": self.total_block,
-                            "model_name": self.model_name,
-                            "data_name": self.data_name,
-                            "num_sample": self.num_sample,
-                            "control_count": self.control_count,
-                            "batch_size": self.batch_size,
-                            "lr": self.lr,
-                            "weight_decay": self.weight_decay,
-                            "clip_grad_norm": self.clip_grad_norm,
-                            "fine_tune_config": self.fine_tune_config
-                            }
-                self.send_to_response(client_id, pickle.dumps(response))
+            response = {
+                "action":            "START",
+                "message":           "Server accept the connection!",
+                "parameters":        None,   
+                "cut_layers":        self.cut_layers,
+                "total_block":       self.total_block,
+                "model_name":        self.model_name,
+                "data_name":         self.data_name,
+                "num_sample":        self.num_sample,
+                "control_count":     self.control_count,
+                "batch_size":        self.batch_size,
+                "lr":                self.lr,
+                "weight_decay":      self.weight_decay,
+                "clip_grad_norm":    self.clip_grad_norm,
+                "fine_tune_config":  self.fine_tune_config,
+                "opt_config":        self.opt_config,
+                "refresh_each_round": self.refresh_each_round,  
+            }
+            src.Log.print_with_color(
+                f"[>>>] START → client {client_id} layer {layer_id}", "red"
+            )
+            self.send_to_response(client_id, pickle.dumps(response))
 
 
+    def _merge_layer_files(self):
+        """
+        Merge GPT2_layer1.pt (wte, wpe, h.0-3) và GPT2_layer2.pt (h.4-11, ln_f, lm_head)
+        thành GPT2.pt đầy đủ để round tiếp theo load.
+        Layer 2 keys cần được remap: h.0 → h.{cut_layers}, h.1 → h.{cut_layers+1}, ...
+        """
+        f1 = f"{self.model_name}_layer1.pt"
+        f2 = f"{self.model_name}_layer2.pt"
+
+        if not os.path.exists(f1) or not os.path.exists(f2):
+            src.Log.print_with_color(
+                f"[WARN] Merge skipped: {f1} exists={os.path.exists(f1)}, "
+                f"{f2} exists={os.path.exists(f2)}", "yellow"
+            )
+            return
+
+        sd1 = torch.load(f1, map_location="cpu")
+        sd2 = torch.load(f2, map_location="cpu")
+
+        merged = {}
+
+        for k, v in sd1.items():
+            merged[k] = v
+
+        for k, v in sd2.items():
+            if k.startswith("h."):
+                parts   = k.split(".")
+                old_idx = int(parts[1])
+                new_idx = old_idx + self.cut_layers
+                new_k   = ".".join([parts[0], str(new_idx)] + parts[2:])
+                merged[new_k] = v
             else:
-                src.Log.print_with_color(f"[>>>] Sent stop training request to client {client_id}", "red")
-                response = {"action": "STOP",
-                            "message": "Stop training!",
-                            "parameters": None}
-                self.send_to_response(client_id, pickle.dumps(response))
 
+                merged[k] = v
+
+
+        if "lm_head.weight" not in merged and "wte.weight" in merged:
+            merged["lm_head.weight"] = merged["wte.weight"].clone()
+
+        out_file = f"{self.model_name}.pt"
+        torch.save(merged, out_file)
+        src.Log.print_with_color(
+            f"[>>>] Merged {f1} + {f2} → {out_file} "
+            f"({len(merged)} keys)", "green"
+        )
+        self.logger.log_info(f"Merged layer files → {out_file}")
+
+    def _reconnect(self):
+        src.Log.print_with_color("[>>>] Reconnecting to RabbitMQ...", "yellow")
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+        credentials = pika.PlainCredentials(
+            self.config["rabbit"]["username"],
+            self.config["rabbit"]["password"]
+        )
+        self.connection = pika.BlockingConnection(
+            pika.ConnectionParameters(
+                host=self.config["rabbit"]["address"],
+                port=5672,
+                virtual_host=self.config["rabbit"]["virtual-host"],
+                credentials=credentials,
+                heartbeat=0,
+                blocked_connection_timeout=None,
+            )
+        )
+        self.channel       = self.connection.channel()
+        self.reply_channel = self.connection.channel()
+        self.channel.queue_declare(queue="rpc_queue")
+        self.channel.basic_qos(prefetch_count=1)
+        self.channel.basic_consume(queue="rpc_queue", on_message_callback=self.on_request)
+        src.Log.print_with_color("[>>>] Reconnected successfully.", "green")
 
     def start(self):
-        self.channel.start_consuming()
+        while True:
+            try:
+                self.channel.start_consuming()
+            except (
+                pika.exceptions.ChannelWrongStateError,
+                pika.exceptions.StreamLostError,
+                pika.exceptions.ConnectionClosedByBroker,
+                Exception,
+            ) as e:
+                src.Log.print_with_color(
+                    f"[WARN] Connection error: {e} — reconnecting...", "yellow"
+                )
+                try:
+                    self._reconnect()
+                except Exception as re:
+                    src.Log.print_with_color(f"[ERROR] Reconnect failed: {re}", "red")
+                    import time; time.sleep(5)
 
     def send_to_response(self, client_id, message):
-        reply_queue_name = f'reply_{client_id}'
+        reply_queue_name = f"reply_{client_id}"
         self.reply_channel.queue_declare(reply_queue_name, durable=False)
-
-        src.Log.print_with_color(f"[>>>] Sent notification to client {client_id}", "red")
         self.reply_channel.basic_publish(
-            exchange='',
-            routing_key=reply_queue_name,
-            body=message
+            exchange="", routing_key=reply_queue_name, body=message
         )
-
-    def avg_all_parameters(self):
-        layer_sizes = self.global_client_sizes
-        layer_params = self.global_model_parameters
-
-        for layer_idx, list_state_dicts in enumerate(layer_params):
-            list_sizes = layer_sizes[layer_idx]
-            if not list_state_dicts or not list_sizes:
-                self.avg_state_dict.append({})
-                continue
-            avg_sd = src.Utils.fed_avg_state_dicts(list_state_dicts, weights=list_sizes)
-            self.avg_state_dict.append(avg_sd)
-
-    def concatenate(self):
-        avg_layers = self.avg_state_dict
-        if not avg_layers:
-            print(f"Warning: don't has averaged layers, skipping.")
-
-        full_dict = {}
-        for idx, layer_dict in enumerate(avg_layers):
-            if idx == 0:
-                sd = layer_dict
-                full_dict.update(copy.deepcopy(sd))
-            else:
-                sd = src.Utils.change_keys(layer_dict, self.cut_layers, True)
-                full_dict.update(copy.deepcopy(sd))
-
-        return full_dict

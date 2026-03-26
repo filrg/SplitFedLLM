@@ -15,8 +15,9 @@ parser.add_argument('--device', type=str, required=False, help='Device of client
 
 args = parser.parse_args()
 
-with open("config.yaml", "r", encoding="utf-8") as file:
+with open('config.yaml', 'r') as file:
     config = yaml.safe_load(file)
+
 client_id = uuid.uuid4()
 address = config["rabbit"]["address"]
 username = config["rabbit"]["username"]
@@ -36,17 +37,7 @@ else:
     print(f"Using device: {device}")
 
 credentials = pika.PlainCredentials(username, password)
-# FIX: heartbeat=0 tắt timeout, tránh StreamLostError khi train lâu
-connection = pika.BlockingConnection(
-    pika.ConnectionParameters(
-        host=address,
-        port=5672,
-        virtual_host=f'{virtual_host}',
-        credentials=credentials,
-        heartbeat=0,
-        blocked_connection_timeout=None,
-    )
-)
+connection = pika.BlockingConnection(pika.ConnectionParameters(address, 5672, f'{virtual_host}', credentials))
 channel = connection.channel()
 
 if __name__ == "__main__":
@@ -56,3 +47,4 @@ if __name__ == "__main__":
     client = RpcClient(client_id, args.layer_id, channel, device)
     client.send_to_server(data)
     client.wait_response()
+

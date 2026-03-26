@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser(description="Split learning framework with cont
 
 args = parser.parse_args()
 
-with open('config.yaml') as file:
+with open("config.yaml", "r", encoding="utf-8") as file:
     config = yaml.safe_load(file)
 address = config["rabbit"]["address"]
 username = config["rabbit"]["username"]
