@@ -49,7 +49,7 @@ def change_keys(state_dict, num, increase=True):
 
     return new_state_dict
 
-def fed_avg_state_dicts(state_dicts, weights = None):
+def fed_avg_state_dicts(state_dicts, weights=None):
     num = len(state_dicts)
     if num == 0:
         raise ValueError("fed_avg_state_dicts: don't have any state_dict.")
@@ -57,25 +57,35 @@ def fed_avg_state_dicts(state_dicts, weights = None):
     if weights is None:
         weights = [1.0] * num
     total_w = sum(weights)
+    if total_w == 0:
+        raise ValueError("fed_avg_state_dicts: tổng weight = 0.")
 
     all_keys = set().union(*(sd.keys() for sd in state_dicts))
     avg_dict = {}
 
     for key in all_keys:
+        acc   = None
+        acc_w = 0.0   # Fix: theo dõi tổng weight thực sự đóng góp cho key này
 
-        acc = None
         for sd, w in zip(state_dicts, weights):
             if key not in sd:
                 continue
             t = sd[key].float()
             if torch.isnan(t).any():
-                t = torch.nan_to_num(t)  # zero-fill
+                t = torch.nan_to_num(t, nan=0.0)
             t = t * w
-            acc = t if acc is None else acc + t
+            acc    = t if acc is None else acc + t
+            acc_w += w
 
-        avg = acc / total_w
+        # Fix: nếu key không có trong bất kỳ state_dict nào → bỏ qua
+        if acc is None or acc_w == 0:
+            continue
 
-        orig = next(sd[key] for sd in state_dicts if key in sd)
+        avg = acc / acc_w   # Fix: chia cho tổng weight thực tế của key, không total_w
+
+        orig = next((sd[key] for sd in state_dicts if key in sd), None)
+        if orig is None:
+            continue
         if orig.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.bool):
             avg = avg.round().to(orig.dtype)
         else:

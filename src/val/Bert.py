@@ -9,7 +9,7 @@ def val_Bert(model_name, data_name, state_dict_full, logger):
     criterion = nn.CrossEntropyLoss()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    test_loader = dataloader(model_name==model_name, data_name=data_name, train=False)
+    test_loader = dataloader(model_name=model_name, data_name=data_name, train=False)
     model = Bert()
     model = model.to(device)
     model.load_state_dict(state_dict_full)
@@ -34,6 +34,8 @@ def val_Bert(model_name, data_name, state_dict_full, logger):
     print(f"Test Loss: {avg_loss:.2f}; Test Acc: {acc:.2f}")
 
     logger.log_info(f"Test Loss: {avg_loss:.2f}; Test Acc: {acc:.2f}")
+
+    return True
 
 
 

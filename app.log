@@ -1,0 +1,22 @@
+2026-03-24 14:58:30,184 - my_logger - INFO - Application start. Server waiting for [1, 1] clients.
+2026-03-24 15:01:29,011 - my_logger - INFO - Start training round 1
+2026-03-24 22:44:03,514 - my_logger - INFO - Application start. Server waiting for [1, 1] clients.
+2026-03-24 22:45:14,428 - my_logger - INFO - Start training round 1
+2026-03-25 09:13:23,571 - my_logger - INFO - Round 1 complete. Waiting for READY.
+2026-03-25 09:13:29,550 - my_logger - INFO - Round 1 fully complete.
+2026-03-25 09:13:32,331 - my_logger - INFO - Start training round 2
+2026-03-25 19:44:00,127 - my_logger - INFO - Application start. Server waiting for [1, 1] clients.
+2026-03-25 19:45:03,466 - my_logger - INFO - Start training round 1
+2026-03-25 19:47:07,712 - my_logger - INFO - Start training round 1
+2026-03-25 19:47:19,011 - my_logger - INFO - Start training round 1
+2026-03-25 19:49:41,646 - my_logger - INFO - Start training round 1
+2026-03-25 19:52:49,376 - my_logger - INFO - Application start. Server waiting for [1, 1] clients.
+2026-03-25 19:54:50,514 - my_logger - INFO - Start training round 1
+2026-03-25 19:56:16,092 - my_logger - INFO - Start training round 1
+2026-03-25 19:57:18,773 - my_logger - INFO - Application start. Server waiting for [1, 1] clients.
+2026-03-25 19:57:49,168 - my_logger - INFO - Start training round 1
+2026-03-25 20:05:50,761 - my_logger - INFO - Application start. Server waiting for [1, 1] clients.
+2026-03-25 20:06:20,483 - my_logger - INFO - Start training round 1
+2026-03-26 04:53:12,204 - my_logger - INFO - Round 1 complete. Waiting for READY.
+2026-03-26 04:53:17,911 - my_logger - INFO - Round 1 fully complete.
+2026-03-26 04:53:20,860 - my_logger - INFO - Start training round 2

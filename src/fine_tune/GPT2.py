@@ -7,244 +7,337 @@ import torch
 import torch.nn as nn
 
 import src.Log
+from src.Optimizer import OptimizationBundle
 from transformers import GPT2Tokenizer
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+
 class Ft_GPT2:
     def __init__(self, client_id, layer_id, channel, device):
-        self.client_id = client_id
-        self.layer_id = layer_id
-        self.channel = channel
-        self.device = device
+        self.client_id  = client_id
+        self.layer_id   = layer_id
+        self.channel    = channel
+        self.device     = device
         self.data_count = 0
-        self.gpu_cpu = []
-        self.encode = []
-        self.tokenizer = None
-
-    def send_intermediate_output(self, data_id, output, attention_mask, labels, trace):
-
-        forward_queue_name = f'intermediate_queue_{self.layer_id}'
-        self.channel.queue_declare(forward_queue_name, durable=False)
-
-        if trace:
-            trace.append(self.client_id)
-            start_cpu = time.time()
-            output = output.detach().cpu().numpy()
-            labels = labels.cpu()
-
-            self.gpu_cpu.append(time.time() - start_cpu)
 
 
-            message = pickle.dumps(
-                {"data_id": data_id, "data": output, "label": labels, "trace": trace,
-                "attention_mask": attention_mask.cpu()}
-            )
-        else:
-            message = pickle.dumps(
-                {"data_id": data_id, "data": output.detach().cpu().numpy(), "label": labels.cpu(), "trace": [self.client_id],
-                "attention_mask" :attention_mask.cpu()}
-            )
-        print(f'len message : {len(message)} bytes')
+    def send_intermediate_output(self, data_id, q_numpy, scale, mask_out, labels, trace):
+        fwd_q     = f"intermediate_queue_{self.layer_id}"
+        trace_out = list(trace) + [self.client_id] if trace else [self.client_id]
+        self.channel.queue_declare(fwd_q, durable=False)
+        msg = pickle.dumps({
+            "data_id": data_id,
+            "data":    q_numpy,
+            "scale":   scale,
+            "label":   labels.cpu(),
+            "trace":   trace_out,
+            "mask":    mask_out.cpu(),
+        })
+        print(f"len message: {len(msg)} bytes")
+        self.channel.basic_publish(exchange="", routing_key=fwd_q, body=msg)
+
+    def send_end_signal(self):
+        fwd_q = f"intermediate_queue_{self.layer_id}"
+        self.channel.queue_declare(fwd_q, durable=False)
         self.channel.basic_publish(
-            exchange='',
-            routing_key=forward_queue_name,
-            body=message
+            exchange="", routing_key=fwd_q,
+            body=pickle.dumps({"action": "END"})
         )
+        src.Log.print_with_color("[>>>] Client 1 gửi END signal cho client 2", "yellow")
 
     def send_gradient(self, data_id, gradient, trace):
-        to_client_id = trace[-1]
-        trace.pop(-1)
-        backward_queue_name = f'gradient_queue_{self.layer_id - 1}_{to_client_id}'
-        self.channel.queue_declare(queue=backward_queue_name, durable=False)
-
-        message = pickle.dumps(
-            {"data_id": data_id, "data": gradient.detach().cpu().numpy(), "trace": trace})
-
-        self.channel.basic_publish(
-            exchange='',
-            routing_key=backward_queue_name,
-            body=message
-        )
+        to_id = trace[-1]
+        trace = trace[:-1]
+        bwd_q = f"gradient_queue_{self.layer_id - 1}_{to_id}"
+        self.channel.queue_declare(queue=bwd_q, durable=False)
+        msg = pickle.dumps({
+            "data_id": data_id,
+            "data":    gradient.detach().cpu().numpy(),
+            "trace":   trace,
+        })
+        self.channel.basic_publish(exchange="", routing_key=bwd_q, body=msg)
 
     def send_to_server(self, message):
-        self.channel.queue_declare('rpc_queue', durable=False)
-        self.channel.basic_publish(exchange='',
-                                   routing_key='rpc_queue',
-                                   body=pickle.dumps(message))
+        self.channel.queue_declare("rpc_queue", durable=False)
+        self.channel.basic_publish(
+            exchange="", routing_key="rpc_queue", body=pickle.dumps(message)
+        )
 
-    def first_layer(self, model, lr, weight_decay, clip_grad_norm, control_count=1,
-                             train_loader=None):
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        backward_queue_name = f'gradient_queue_{self.layer_id}_{self.client_id}'
-        self.channel.queue_declare(queue=backward_queue_name, durable=False)
+
+    def first_layer(self, model, lr, weight_decay, clip_grad_norm,
+                    control_count=1, train_loader=None,
+                    opt: OptimizationBundle = None):
+
+        if opt is None:
+            opt = OptimizationBundle({})
+
+        optimizer  = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        bwd_q_name = f"gradient_queue_{self.layer_id}_{self.client_id}"
+        self.channel.queue_declare(queue=bwd_q_name, durable=False)
         self.channel.basic_qos(prefetch_count=1)
-
         model = model.to(self.device)
-        forward_time = []
-        backward_time = []
-        comm_time = []
 
-        for i in range(1):
-            data_iter = iter(train_loader)
-            num_forward = 0
-            num_backward = 0
-            end_data = False
-            data_store = {}
+        forward_t  = []
+        backward_t = []
+        comm_t     = []
+        data_iter  = iter(train_loader)
+        num_fwd = num_bwd = 0
+        end_data   = False
+        data_store = {}
+        scheduler  = CosineAnnealingLR(
+            optimizer, T_max=max(len(train_loader), 1), eta_min=lr / 10
+        )
 
-            with tqdm(total=len(train_loader), desc="Processing", unit="step") as pbar:
-                while True:
-                    # Training model
-                    model.train()
+        with tqdm(total=len(train_loader), desc="Layer 1", unit="step") as pbar:
+            while True:
+                model.train()
+
+                method_frame, _, body = self.channel.basic_get(
+                    queue=bwd_q_name, auto_ack=True
+                )
+                if method_frame and body:
+                    num_bwd  += 1
+                    recv      = pickle.loads(body)
+                    gradient  = torch.tensor(recv["data"]).to(self.device)
+                    # FIX: cast gradient về đúng dtype của inter (fp16/fp32)
+                    gradient  = gradient.to(dtype=inter.dtype)
+                    data_id   = recv["data_id"]
+                    inter     = data_store.pop(data_id)
+
+                    if torch.isnan(gradient).any():
+                        print("[ERROR] Skip backward layer 1 (NaN gradient)")
+                        continue
+
                     optimizer.zero_grad()
+                    inter.backward(gradient)
 
-                    # Process gradient
-                    method_frame, header_frame, body = self.channel.basic_get(queue=backward_queue_name, auto_ack=True)
-                    if method_frame and body:
-                        num_backward += 1
-                        received_data = pickle.loads(body)
-                        gradient_numpy = received_data["data"]
-                        gradient = torch.tensor(gradient_numpy).to(self.device)
-                        data_id = received_data["data_id"]
+                    has_nan = any(
+                        p.grad is not None and torch.isnan(p.grad).any()
+                        for p in model.parameters()
+                    )
+                    if has_nan:
+                        print("[ERROR] NaN grad → skip step")
+                        optimizer.zero_grad()
+                        continue
 
-                        data_input = data_store.pop(data_id)
-                        start_backward = time.time()
-                        output, mask = model(input_ids=data_input[0], attention_mask=data_input[1])
-                        output.backward(gradient=gradient)
-                        optimizer.step()
-                        stop_backward = time.time()
-                        backward_time.append(stop_backward - start_backward)
-                    else:
-                        # speed control
-                        if len(data_store) >= control_count:
-                            continue
+                    if clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
 
-                        try:
-                            batch = next(data_iter)
-                            input_ids = batch['input_ids'].to(self.device)
-                            attention_mask = batch['attention_mask'].to(self.device)
-                            labels = batch['labels'].to(self.device)
-                            data_id = uuid.uuid4()
-                            data_store[data_id] = (input_ids, attention_mask)
-                            start_forward = time.time()
-                            intermediate_output, mask = model(input_ids=input_ids, attention_mask=attention_mask)
-                            stop_forward = time.time()
-                            forward_time.append(stop_forward - start_forward)
-                            intermediate_output = intermediate_output.detach().requires_grad_(True)
+                    optimizer.step()
+                    scheduler.step()
+                    pbar.update(1)
 
-                            num_forward += 1
-                            self.data_count += 1
+                else:
 
-                            pbar.update(1)
-                            start_comm = time.time()
-                            self.send_intermediate_output(data_id, intermediate_output, mask,
-                                                          labels, trace=None)
-                            stop_comm = time.time()
-                            comm_time.append(start_comm - stop_comm)
+                    if len(data_store) >= control_count:
+                        continue
+                    try:
+                        batch   = next(data_iter)
+                        inp_ids = batch["input_ids"].to(self.device)
+                        attn    = batch["attention_mask"].to(self.device)
+                        labels  = batch["labels"].to(self.device)
+                        data_id = uuid.uuid4()
 
-                        except StopIteration:
-                            end_data = True
+                        t0 = time.time()
+                        with opt.precision_ctx(self.device):
+                            out      = model(input_ids=inp_ids, attention_mask=attn)
+                            inter    = out["hidden_states"]
+                            mask_out = out["mask"]
+                            inter    = inter.detach().requires_grad_(True)
+                            data_store[data_id] = inter
+                        forward_t.append(time.time() - t0)
 
-                    if end_data and (num_forward == num_backward):
-                        break
+                        num_fwd += 1
+                        self.data_count += 1
 
-        notify_data = {"action": "NOTIFY", "client_id": self.client_id, "layer_id": self.layer_id,
-                       "message": "Finish training!"}
+                        t0 = time.time()
+                        q_numpy, scale = opt.quant(inter)
+                        self.send_intermediate_output(
+                            data_id, q_numpy, scale, mask_out, labels, trace=None
+                        )
+                        comm_t.append(time.time() - t0)
 
-        src.Log.print_with_color("[>>>] Finish training!", "red")
-        self.send_to_server(notify_data)
+                    except StopIteration:
+                        end_data = True
 
-        broadcast_queue_name = f'reply_{self.client_id}'
-        while True:  # Wait for broadcast
-            method_frame, header_frame, body = self.channel.basic_get(queue=broadcast_queue_name, auto_ack=True)
+                if end_data and num_fwd == num_bwd:
+                    break
+
+        self.send_end_signal()
+
+        notify = {
+            "action":    "NOTIFY",
+            "client_id": self.client_id,
+            "layer_id":  self.layer_id,
+            "message":   "Finish training!",
+        }
+        src.Log.print_with_color("[>>>] Client 1 gửi NOTIFY về server", "red")
+        self.send_to_server(notify)
+
+        # Chờ PAUSE từ server
+        bcast_q = f"reply_{self.client_id}"
+        while True:
+            _, _, body = self.channel.basic_get(queue=bcast_q, auto_ack=True)
             if body:
-                received_data = pickle.loads(body)
-                src.Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
-                if received_data["action"] == "PAUSE":
-                    print(f'forward: {forward_time}')
-                    print(f'backward: {backward_time}')
-                    print(f'comm: {comm_time}')
+                recv = pickle.loads(body)
+                src.Log.print_with_color(f"[<<<] Client 1: {recv['action']}", "blue")
+                if recv["action"] == "PAUSE":
+                    src.Log.print_with_color(
+                        f"[INFO] Forward: {len(forward_t)} steps, "
+                        f"Backward: {num_bwd} steps", "green"
+                    )
                     return True, self.data_count
             time.sleep(0.5)
 
-    def last_layer(self, model, lr, weight_decay, clip_grad_norm):
+
+
+    def last_layer(self, model, lr, weight_decay, clip_grad_norm,
+                   opt: OptimizationBundle = None):
+
+        if opt is None:
+            opt = OptimizationBundle({})
+
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
+        if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-            pad_id = tokenizer.eos_token_id
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-        result = True
+        criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        result    = True
 
-        forward_queue_name = f'intermediate_queue_{self.layer_id - 1}'
-        self.channel.queue_declare(queue=forward_queue_name, durable=False)
+        scheduler = CosineAnnealingLR(optimizer, T_max=1000, eta_min=lr / 10)
+
+        fwd_q_name = f"intermediate_queue_{self.layer_id - 1}"
+        self.channel.queue_declare(queue=fwd_q_name, durable=False)
         self.channel.basic_qos(prefetch_count=1)
-        print('Waiting for intermediate output. To exit press CTRL+C')
+        src.Log.print_with_color("Layer 2: Waiting for hidden states...", "green")
         model.to(self.device)
         model.train()
-        exec_time = []
-        comm_time = []
+
+        exec_t        = []
+        comm_t        = []
+        num_received  = 0
+        num_grad_sent = 0
+        end_received  = False
+        nan_count     = 0
+
         while True:
-            method_frame, header_frame, body = self.channel.basic_get(queue=forward_queue_name, auto_ack=True)
+            method_frame, _, body = self.channel.basic_get(
+                queue=fwd_q_name, auto_ack=True
+            )
             if method_frame and body:
-                optimizer.zero_grad()
-                received_data = pickle.loads(body)
-                intermediate_output_numpy = received_data["data"]
-                attention_mask = received_data["attention_mask"].to(self.device)
-                trace = received_data["trace"]
-                data_id = received_data["data_id"]
-                labels = received_data["label"].to(self.device)
+                recv = pickle.loads(body)
 
-                intermediate_output = torch.tensor(intermediate_output_numpy, requires_grad=True).to(self.device)
+                # END sentinel
+                if recv.get("action") == "END":
+                    src.Log.print_with_color(
+                        f"[<<<] END received. Received {num_received} batches, "
+                        f"sent {num_grad_sent} gradients.", "yellow"
+                    )
+                    end_received = True
+                    continue
 
-                start = time.time()
-                output, _ = model(input_ids=intermediate_output, attention_mask=attention_mask)
-                shift_logits = output[:, :-1, :].contiguous()  # [B, L-1, V]
-                shift_labels = labels[:, 1:].contiguous()  # [B, L-1]
+                mask    = recv["mask"].to(self.device)
+                trace   = recv["trace"]
+                data_id = recv["data_id"]
+                labels  = recv["label"].to(self.device)
+                num_received += 1
 
-                loss = criterion(
-                    shift_logits.view(-1, shift_logits.size(-1)),  # [(B*(L-1)), V]
-                    shift_labels.view(-1)  # [(B*(L-1))]
+                inter = opt.dequant(
+                    recv["data"], recv.get("scale"), self.device, requires_grad=True
                 )
+                # FIX: đồng bộ dtype của inter với model để tránh Half/Float mismatch
+                model_dtype = next(model.parameters()).dtype
+                inter = inter.to(dtype=model_dtype)
 
-                # loss = criterion(output.view(-1, output.size(-1)), labels.view(-1))
-                if torch.isnan(loss).any():
-                    src.Log.print_with_color("NaN detected in loss", "yellow")
-                    result = False
+                optimizer.zero_grad()
 
-                print(f"Loss: {loss.item()}")
-                intermediate_output.retain_grad()
-                loss.backward()
+                t0 = time.time()
+                with opt.precision_ctx(self.device):
+                    out          = model(input_ids=inter, attention_mask=mask)
+                    output       = out["logits"]
+                    shift_logits = output[:, :-1, :].contiguous()
+                    shift_labels = labels[:, 1:].contiguous()
+                    loss         = criterion(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                    )
 
-                optimizer.step()
-                exec_time.append(time.time() - start)
+                if torch.isnan(loss):
+                    src.Log.print_with_color("NaN loss — sending zero gradient", "yellow")
+                    nan_count += 1
+                    num_grad_sent += 1
+                    self.send_gradient(data_id, torch.zeros_like(inter), trace)
+                    continue
+
+                print(f"Loss: {loss.item():.4f}")
+
+                inter.retain_grad()
+
+                if opt.scaler is not None:
+                    opt.scaler.scale(loss).backward()
+                    opt.scaler.unscale_(optimizer)
+                    if clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                    opt.scaler.step(optimizer)
+                    opt.scaler.update()
+                else:
+                    loss.backward()
+                    if clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                    optimizer.step()
+
+                scheduler.step()
+                exec_t.append(time.time() - t0)
                 self.data_count += 1
 
-                gradient = intermediate_output.grad
-                start_comm = time.time()
-                self.send_gradient(data_id, gradient, trace)  # 1F1B
-                comm_time.append(time.time() - start_comm)
-            # Check training process
+
+                t0   = time.time()
+                grad = inter.grad if inter.grad is not None else torch.zeros_like(inter)
+                if inter.grad is None:
+                    src.Log.print_with_color(
+                        "[WARN] inter.grad is None — sending zero gradient", "yellow"
+                    )
+                self.send_gradient(data_id, grad, trace)
+                num_grad_sent += 1
+                comm_t.append(time.time() - t0)
+
             else:
-                broadcast_queue_name = f'reply_{self.client_id}'
-                method_frame, header_frame, body = self.channel.basic_get(queue=broadcast_queue_name, auto_ack=True)
+
+                if end_received and num_grad_sent == num_received:
+                    if num_received > 0 and nan_count / num_received > 0.5:
+                        result = False
+                        src.Log.print_with_color(
+                            f"[WARN] {nan_count}/{num_received} batches NaN → round failed",
+                            "yellow"
+                        )
+
+                    src.Log.print_with_color(
+                        f"[>>>] Tất cả {num_grad_sent} gradient đã gửi. Gửi NOTIFY.", "red"
+                    )
+                    notify = {
+                        "action":    "NOTIFY",
+                        "client_id": self.client_id,
+                        "layer_id":  self.layer_id,
+                        "message":   "Finish training!",
+                    }
+                    self.send_to_server(notify)
+                    end_received = False
+
+                # Chờ PAUSE từ server
+                bcast_q = f"reply_{self.client_id}"
+                _, _, body = self.channel.basic_get(queue=bcast_q, auto_ack=True)
                 if body:
-                    received_data = pickle.loads(body)
-                    src.Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
-                    if received_data["action"] == "PAUSE":
-                        print(f'exec_time: {exec_time}')
-                        print(f'comm_time: {comm_time}')
+                    recv = pickle.loads(body)
+                    src.Log.print_with_color(f"[<<<] Client 2: {recv['action']}", "blue")
+                    if recv["action"] == "PAUSE":
+                        src.Log.print_with_color(
+                            f"[INFO] Exec: {len(exec_t)} steps", "green"
+                        )
                         return result, self.data_count
 
-    def train_on_middle_layer(self, model, lr, momentum, clip_grad_norm, control_count=5, cluster=None):
-        pass
+                time.sleep(0.1)
 
-    def alone_training(self, model, lr, momentum, clip_grad_norm, train_loader=None, cluster=None):
-        pass
-
-
-
-
-
-
-
+    def train_on_middle_layer(self, *args, **kwargs): pass
+    def alone_training(self, *args, **kwargs): passs

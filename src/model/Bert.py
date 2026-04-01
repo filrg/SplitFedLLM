@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.Optimizer import flash_scaled_dot_product
 
 class DotDict(dict):
     def __getattr__(self, k):
@@ -37,47 +38,35 @@ class BertEmbeddings(nn.Module):
         return embeddings
 
 class BertSdpaSelfAttention(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, dropout_prob):
+    def __init__(self, hidden_size, num_attention_heads, dropout_prob, use_flash=False):
         super(BertSdpaSelfAttention, self).__init__()
         self.num_attention_heads = num_attention_heads
         self.attention_head_size = int(hidden_size / num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.use_flash = use_flash
 
         self.query = nn.Linear(hidden_size, self.all_head_size)
         self.key = nn.Linear(hidden_size, self.all_head_size)
         self.value = nn.Linear(hidden_size, self.all_head_size)
         self.dropout = nn.Dropout(dropout_prob)
+        self._dropout_p = dropout_prob
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
+        return x.permute(0, 2, 1, 3)   # (B, H, T, D)
 
     def forward(self, hidden_states):
+        q = self.transpose_for_scores(self.query(hidden_states))
+        k = self.transpose_for_scores(self.key(hidden_states))
+        v = self.transpose_for_scores(self.value(hidden_states))
 
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
-
-        query_layer = self.transpose_for_scores(mixed_query_layer)
-        key_layer = self.transpose_for_scores(mixed_key_layer)
-        value_layer = self.transpose_for_scores(mixed_value_layer)
-
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-
-        import math
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-
-        attention_probs = F.softmax(attention_scores, dim=-1)
-        attention_probs = self.dropout(attention_probs)
-
-        context_layer = torch.matmul(attention_probs, value_layer)
+        dp = self._dropout_p if self.training else 0.0
+        context_layer = flash_scaled_dot_product(q, k, v, dropout_p=dp)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(*new_context_layer_shape)
-
-        return context_layer
+        new_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        return context_layer.view(*new_shape)
 
 class BertSelfOutput(nn.Module):
     def __init__(self, hidden_size, dropout_prob):
@@ -93,9 +82,10 @@ class BertSelfOutput(nn.Module):
         return hidden_states
 
 class BertAttention(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, dropout_prob):
+    def __init__(self, hidden_size, num_attention_heads, dropout_prob, use_flash=False):
         super(BertAttention, self).__init__()
-        self.self = BertSdpaSelfAttention(hidden_size, num_attention_heads, dropout_prob)
+        self.self = BertSdpaSelfAttention(hidden_size, num_attention_heads,
+                                          dropout_prob, use_flash=use_flash)
         self.output = BertSelfOutput(hidden_size, dropout_prob)
 
     def forward(self, hidden_states):
@@ -128,9 +118,11 @@ class BertOutput(nn.Module):
         return hidden_states
 
 class BertLayer(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, intermediate_size, dropout_prob):
+    def __init__(self, hidden_size, num_attention_heads, intermediate_size,
+                 dropout_prob, use_flash=False):
         super(BertLayer, self).__init__()
-        self.attention = BertAttention(hidden_size, num_attention_heads, dropout_prob)
+        self.attention = BertAttention(hidden_size, num_attention_heads,
+                                       dropout_prob, use_flash=use_flash)
         self.intermediate = BertIntermediate(hidden_size, intermediate_size)
         self.output = BertOutput(hidden_size, intermediate_size, dropout_prob)
 
@@ -165,10 +157,12 @@ class BertClassifier(nn.Module):
 
 class Bert(nn.Module):
     def __init__( self, vocab_size=28996, hidden_size=768, num_attention_heads=12, intermediate_size=3072,
-        max_position_embeddings=512, type_vocab_size=2, dropout_prob=0.1, layer_id=0, n_block=12
+        max_position_embeddings=512, type_vocab_size=2, dropout_prob=0.1, layer_id=0, n_block=12,
+        use_flash=False
     ):
         super(Bert, self).__init__()
         self.layer_id = layer_id
+        self.use_flash = use_flash
         self.config = DotDict(
             model_type="bert",
             vocab_size=vocab_size,
@@ -180,29 +174,30 @@ class Bert(nn.Module):
             use_return_dict=True, output_attentions=False, output_hidden_states=False
         )
 
+        def _make_layers(n):
+            return nn.ModuleList([
+                BertLayer(hidden_size, num_attention_heads, intermediate_size,
+                          dropout_prob, use_flash=use_flash)
+                for _ in range(n)
+            ])
+
         if self.layer_id == 1:
-            self.embeddings = BertEmbeddings(vocab_size=vocab_size, hidden_size=hidden_size, max_position_embeddings=max_position_embeddings,
-                                             type_vocab_size=type_vocab_size,dropout_prob=dropout_prob)
-            self.layers = nn.ModuleList(
-                [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
-                 for _ in range(n_block)]
-            )
+            self.embeddings = BertEmbeddings(
+                vocab_size=vocab_size, hidden_size=hidden_size,
+                max_position_embeddings=max_position_embeddings,
+                type_vocab_size=type_vocab_size, dropout_prob=dropout_prob)
+            self.layers = _make_layers(n_block)
         elif self.layer_id == 2:
-            self.layers = nn.ModuleList(
-                [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
-                 for _ in range(n_block)]
-            )
+            self.layers = _make_layers(n_block)
             self.pooler = BertPooler(hidden_size)
             self.dropout = nn.Dropout(dropout_prob)
             self.classifier = nn.Linear(hidden_size, 4)
         else:
-            self.embeddings = BertEmbeddings(vocab_size=vocab_size, hidden_size=hidden_size,
-                                             max_position_embeddings=max_position_embeddings,
-                                             type_vocab_size=type_vocab_size, dropout_prob=dropout_prob)
-            self.layers = nn.ModuleList(
-                [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
-                 for _ in range(n_block)]
-            )
+            self.embeddings = BertEmbeddings(
+                vocab_size=vocab_size, hidden_size=hidden_size,
+                max_position_embeddings=max_position_embeddings,
+                type_vocab_size=type_vocab_size, dropout_prob=dropout_prob)
+            self.layers = _make_layers(n_block)
             self.pooler = BertPooler(hidden_size)
             self.dropout = nn.Dropout(dropout_prob)
             self.classifier = nn.Linear(hidden_size, 4)

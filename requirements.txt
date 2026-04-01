@@ -1,8 +1,19 @@
-torch
+torch>=2.0.0
 pika~=1.3.2
 transformers>=4.36.2
 datasets
-peft
+peft>=0.9.0
 numpy
 nltk
 rouge_score
+
+# ── Tối ưu hóa ────────────────────────────────────────────────
+# QLoRA + INT8: quantize base model xuống 4-bit / 8-bit
+bitsandbytes>=0.43.0
+
+# Flash Attention 2: cần GPU Ampere+ (RTX 30xx, A100, H100,...)
+# Cài thủ công nếu cần: pip install flash-attn --no-build-isolation
+flash-attn>=2.5.0; sys_platform != "win32"
+
+# Accelerate: dùng chung với bitsandbytes & gradient checkpointing
+accelerate>=0.27.0
