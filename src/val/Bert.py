@@ -43,6 +43,8 @@ def val_Bert(state_dict_full, cut_layers , bottleneck_config, logger):
             logits = client(input_ids=input_ids)
             logits = server(input_ids=logits)
             loss = criterion(logits, labels)
+            if torch.isnan(loss).any():
+                return False
             total_loss += loss.item()
             correct += (logits.argmax(1) == labels).sum().item()
             total += labels.size(0)
@@ -53,6 +55,7 @@ def val_Bert(state_dict_full, cut_layers , bottleneck_config, logger):
     print(f"Test Loss: {avg_loss:.4f}; Test Acc: {acc:.4f}")
 
     logger.log_info(f"Test Loss: {avg_loss:.4f}; Test Acc: {acc:.4f}")
+    return True
 
 
 

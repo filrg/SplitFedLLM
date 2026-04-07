@@ -172,13 +172,14 @@ class Server:
 
                     if not get_val(self.avg_state_dict, self.cut_layers, self.bottleneck_config, self.logger):
                         self.logger.log_warning("Training failed!")
+                        self.round = 0
                     else:
                         # Save to files
                         torch.save(state_dict_full, f'{self.model_name}.pt')
                         self.round -= 1
                     self.avg_state_dict = []
                 else:
-                    self.round -= 1
+                    self.round = 0
 
                 # Start a new training round
                 self.round_result = True
