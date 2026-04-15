@@ -5,10 +5,12 @@ server:
     - 1
     - 1
   cut-layers: 4
-  model-name: Bert
-  data-name: EMOTION
+  model-name: BERT # GPT2 / BERT
+  data-name: AGNEWS # SQUAD / AGNEWS
   model:
-    Bert:
+    BERT:
+      n_block: 12
+    GPT2:
       n_block: 12
   parameters:
     load: True

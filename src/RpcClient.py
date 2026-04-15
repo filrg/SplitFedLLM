@@ -3,9 +3,11 @@ import pickle
 import copy
 
 import src.Log
-from src.fine_tune.Bert import Ft_Bert
+from src.fine_tune.BERT import Ft_BERT
+from src.fine_tune.GPT2 import Ft_GPT2
 from src.dataset.dataloader import dataloader
-from src.model.Bert import Bert
+from src.model.BERT import BERT
+from src.model.GPT2 import GPT2
 
 from peft import LoraConfig, TaskType, get_peft_model
 
@@ -16,6 +18,7 @@ class RpcClient:
         self.channel = channel
         self.model_train = None
         self.train_loader = None
+        self.model_name = None
         self.device = device
         self.fine_tune_config = None
         self.model = None
@@ -39,6 +42,7 @@ class RpcClient:
         action = self.response["action"]
 
         if action == "START":
+            self.model_name = self.response["model_name"]
             state_dict = self.response["parameters"]
             cut_layers = self.response['cut_layers']
             total_block = self.response['total_block']
@@ -46,15 +50,26 @@ class RpcClient:
             bottleneck_config =self.response['bottleneck_config']
             bottleneck_state_dict = self.response["bottleneck"]
 
+            if self.model_name == 'BERT':
+                self.model_train = Ft_BERT(self.client_id, self.layer_id, self.channel, self.device)
+                peft_config = LoraConfig(
+                    task_type="SEQ_CLS",
+                    r=self.fine_tune_config['LoRA']['r'], lora_alpha=self.fine_tune_config['LoRA']['alpha'],
+                    lora_dropout=0.1,
+                    bias="none",
+                    target_modules=["query", "key", "value", "dense"])
+                klass = BERT
+            else:
+                self.model_train = Ft_GPT2(self.client_id, self.layer_id, self.channel, self.device)
+                peft_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=self.fine_tune_config['LoRA']['r'], lora_alpha=self.fine_tune_config['LoRA']['alpha'], lora_dropout=0.05,
+                    bias="none",
+                    target_modules=["c_attn", "c_proj", "c_fc"],
+                    fan_in_fan_out=True
+                )
+                klass = GPT2
 
-            self.model_train = Ft_Bert(self.client_id, self.layer_id, self.channel, self.device)
-
-            peft_config = LoraConfig(
-                task_type="SEQ_CLS",
-                r=self.fine_tune_config['LoRA']['r'], lora_alpha=self.fine_tune_config['LoRA']['alpha'], lora_dropout=0.1,
-                bias="none",
-                target_modules=["query", "key", "value", "dense"])
-            klass = Bert
             self.model = None
             bottleneck_dict = {}
 
@@ -103,8 +118,9 @@ class RpcClient:
                 else:
                     for p in self.model.parameters():
                         p.requires_grad = False
-                for param in self.model.classifier.parameters():
-                    param.requires_grad = True
+                if self.model_name == 'BERT':
+                    for param in self.model.classifier.parameters():
+                        param.requires_grad = True
 
             return True
 
@@ -120,11 +136,10 @@ class RpcClient:
             if self.layer_id == 1:
                 if self.train_loader is None:
                     src.Log.print_with_color(f"Label: {label_counts[stt]}", 'yellow')
-                    self.train_loader = dataloader(batch_size, label_counts[stt], train=True)
+                    self.train_loader = dataloader(self.model_name, batch_size, label_counts[stt], train=True)
 
                 result, size = self.model_train.first_layer(self.model, lr, weight_decay,
-                                                            control_count, self.train_loader,
-                                                            self.fine_tune_config["client"])
+                                                            control_count, self.train_loader)
             else:
                 result, size = self.model_train.last_layer(self.model, lr, weight_decay)
 

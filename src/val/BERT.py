@@ -2,32 +2,32 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from src.model.Bert import Bert
+from src.model.BERT import BERT
 from src.dataset.dataloader import dataloader
 
-def val_Bert(state_dict_full, cut_layers , bottleneck_config, logger):
+def val_BERT(state_dict_full, cut_layers , bottleneck_config, logger):
     criterion = nn.CrossEntropyLoss()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    test_loader = dataloader(train=False)
+    test_loader = dataloader(model_name='BERT', train=False)
     if bottleneck_config['enable']:
-        client = Bert(layer_id=1, n_block=cut_layers)
+        client = BERT(layer_id=1, n_block=cut_layers)
         client_state_dict = client.state_dict()
         for key in client_state_dict:
             client_state_dict[key] = state_dict_full[0][key]
         client.load_state_dict(client_state_dict)
         client = client.to(device)
-        server = Bert(layer_id=2, n_block=12 - cut_layers)
+        server = BERT(layer_id=2, n_block=12 - cut_layers)
         server_state_dict = server.state_dict()
         for key in server_state_dict:
             server_state_dict[key] = state_dict_full[1][key]
         server.load_state_dict(server_state_dict)
         server = server.to(device)
     else:
-        client = Bert(layer_id=1, n_block=cut_layers)
+        client = BERT(layer_id=1, n_block=cut_layers)
         client.load_state_dict(state_dict_full[0])
         client = client.to(device)
-        server = Bert(layer_id=2, n_block= 12 - cut_layers)
+        server = BERT(layer_id=2, n_block= 12 - cut_layers)
         server.load_state_dict(state_dict_full[1])
         server = server.to(device)
 

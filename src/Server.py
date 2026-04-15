@@ -10,7 +10,8 @@ import copy
 import src.Log
 import src.Utils
 
-from src.model.Bert import Bert
+from src.model.BERT import BERT
+from src.model.GPT2 import GPT2
 from src.val.get_val import get_val
 
 class Server:
@@ -86,18 +87,19 @@ class Server:
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 
     def distribution(self):
-        if self.non_iid:
-            # label_distribution = np.random.dirichlet([self.data_distribution["dirichlet"]["alpha"]] * self.num_label,
-            #                                          self.total_clients[0])
-            label_distribution = np.array([[0.05, 0.05, 0.05, 0.85],
-                                           [0.05, 0.05, 0.85, 0.05],
-                                           [0.05, 0.85, 0.05, 0.05],
-                                           [0.85, 0.05, 0.05, 0.05]
-                                           ])
-            self.label_counts = (label_distribution * self.num_sample).astype(int)
+        if self.model_name == "BERT":
+            if self.non_iid:
+                label_distribution = np.array([[0.05, 0.05, 0.05, 0.85],
+                                               [0.05, 0.05, 0.85, 0.05],
+                                               [0.05, 0.85, 0.05, 0.05],
+                                               [0.85, 0.05, 0.05, 0.05]
+                                               ])
+                self.label_counts = (label_distribution * self.num_sample).astype(int)
 
+            else:
+                self.label_counts = np.full((self.total_clients[0], self.num_label), self.num_sample // self.num_label)
         else:
-            self.label_counts = np.full((self.total_clients[0], self.num_label), self.num_sample // self.num_label)
+            self.label_counts = [[self.num_sample] for _ in range(self.total_clients[0])]
 
     def on_request(self, ch, method, props, body):
         message = pickle.loads(body)
@@ -170,7 +172,7 @@ class Server:
                 if self.save_parameters and self.validation and self.round_result:
                     state_dict_full = self.concatenate()
 
-                    if not get_val(self.avg_state_dict, self.cut_layers, self.bottleneck_config, self.logger):
+                    if not get_val(self.model_name, self.avg_state_dict, self.cut_layers, self.bottleneck_config, self.logger):
                         self.logger.log_warning("Training failed!")
                         self.round = 0
                     else:
@@ -200,7 +202,10 @@ class Server:
     def notify_clients(self, start=True, register=True):
 
         # Send message to clients when consumed all clients
-        klass = Bert
+        if self.model_name == 'BERT':
+            klass = BERT
+        else:
+            klass = GPT2
         stt = -1
 
         for (client_id, layer_id) in self.list_clients:
@@ -259,6 +264,7 @@ class Server:
 
                 response = {"action": "START",
                             "message": "Server accept the connection!",
+                            "model_name": self.model_name,
                             "parameters": copy.deepcopy(state_dict),
                             "bottleneck": copy.deepcopy(bottleneck_state_dict),
                             "cut_layers": self.cut_layers,
