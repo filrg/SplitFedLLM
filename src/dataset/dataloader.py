@@ -1,4 +1,5 @@
 import torch
+import pandas as pd
 from transformers import BertTokenizer, GPT2Tokenizer
 from datasets import load_dataset
 
@@ -7,6 +8,7 @@ from collections import defaultdict
 
 from src.dataset.SQUAD import SQUAD_DATASET
 from src.dataset.AGNEWS import AGNEWS_DATASET
+from src.dataset.E2E import E2E_DATASET
 from torch.utils.data import DataLoader
 
 def AGNEWS(batch_size=None, distribution=None, train=True):
@@ -83,11 +85,51 @@ def SQUAD(batch_size, distribution=None, train=True):
 
         return test_loader
 
+def E2E(batch_size, distribution=None, train=True):
+
+    if distribution is None:
+        distribution = [2000]
+
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    if train:
+        data = pd.read_csv("./data/E2E/trainset.csv")
+        train_data = []
+        for _, row in data.iterrows():
+
+            train_data.append({
+                "mr": row["mr"],
+                "ref": row["ref"]
+            })
+
+        subset = random.sample(train_data, distribution[0])
+
+        train_set = E2E_DATASET(tokenizer, subset, 128)
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+
+        return train_loader
+
+    else:
+        data = pd.read_csv("./data/E2E/devset.csv")
+        test_data = []
+
+        for _, row in data.iterrows():
+            test_data.append({
+                "mr": row["mr"],
+                "ref": row["ref"]
+            })
+
+        test_set = E2E_DATASET(tokenizer, test_data[:distribution[0]], 128)
+        test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+
+        return test_loader
+
 def dataloader(model_name, batch_size=None, distribution=None, train=True):
     if model_name == 'BERT':
         data = AGNEWS(batch_size, distribution, train)
     elif model_name == 'GPT2':
-        data = SQUAD(batch_size, distribution, train)
+        data = E2E(batch_size, distribution, train)
     else:
         raise ValueError(f"Dataset of model {model_name} not supported.")
 

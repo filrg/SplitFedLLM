@@ -64,7 +64,7 @@ class Ft_GPT2:
                                    routing_key='rpc_queue',
                                    body=pickle.dumps(message))
 
-    def first_layer(self, model, lr, weight_decay, control_count=1, train_loader=None):
+    def first_layer(self, model, freeze, lr, weight_decay, control_count=1, train_loader=None):
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         backward_queue_name = f'gradient_queue_{self.layer_id}_{self.client_id}'
@@ -90,15 +90,20 @@ class Ft_GPT2:
                     method_frame, header_frame, body = self.channel.basic_get(queue=backward_queue_name, auto_ack=True)
                     if method_frame and body:
                         num_backward += 1
-                        received_data = pickle.loads(body)
-                        gradient_numpy = received_data["data"]
-                        gradient = torch.tensor(gradient_numpy).to(self.device)
-                        data_id = received_data["data_id"]
+                        if freeze:
+                            received_data = pickle.loads(body)
+                            gradient_numpy = received_data["data"]
+                            gradient = torch.tensor(gradient_numpy).to(self.device)
+                            data_id = received_data["data_id"]
 
-                        data_input = data_store.pop(data_id)
-                        output, mask = model(input_ids=data_input[0], attention_mask=data_input[1])
-                        output.backward(gradient=gradient)
-                        optimizer.step()
+                            data_input = data_store.pop(data_id)
+                            output, mask = model(input_ids=data_input[0], attention_mask=data_input[1])
+                            output.backward(gradient=gradient)
+                            optimizer.step()
+                        else:
+                            received_data = pickle.loads(body)
+                            data_id = received_data["data_id"]
+                            data_input = data_store.pop(data_id)
 
                     else:
                         # speed control
@@ -144,11 +149,11 @@ class Ft_GPT2:
                     return True, self.data_count
             time.sleep(0.5)
 
-    def last_layer(self, model, lr, weight_decay):
+    def last_layer(self, model, freeze, lr, weight_decay):
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         pad_id = tokenizer.eos_token_id
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+        criterion = nn.CrossEntropyLoss(ignore_index=-100)
         result = True
 
         forward_queue_name = f'intermediate_queue_{self.layer_id - 1}'
@@ -179,7 +184,6 @@ class Ft_GPT2:
                     shift_labels.view(-1)  # [(B*(L-1))]
                 )
 
-                # loss = criterion(output.view(-1, output.size(-1)), labels.view(-1))
                 if torch.isnan(loss).any():
                     src.Log.print_with_color("NaN detected in loss", "yellow")
                     result = False
@@ -190,8 +194,10 @@ class Ft_GPT2:
 
                 optimizer.step()
                 self.data_count += 1
-
-                gradient = intermediate_output.grad
+                if freeze:
+                    gradient = intermediate_output.grad
+                else:
+                    gradient = torch.tensor(0.0)
                 self.send_gradient(data_id, gradient, trace)  # 1F1B
 
             # Check training process

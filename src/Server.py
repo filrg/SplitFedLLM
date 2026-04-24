@@ -172,7 +172,7 @@ class Server:
                 if self.save_parameters and self.validation and self.round_result:
                     state_dict_full = self.concatenate()
 
-                    if not get_val(self.model_name, self.avg_state_dict, self.cut_layers, self.bottleneck_config, self.logger):
+                    if not get_val(self.model_name, state_dict_full, self.logger):
                         self.logger.log_warning("Training failed!")
                         self.round = 0
                     else:
@@ -333,10 +333,21 @@ class Server:
         full_dict = {}
         for idx, layer_dict in enumerate(avg_layers):
             if idx == 0:
-                sd = layer_dict
+                sd = {
+                    k: v
+                    for k, v in layer_dict.items()
+                    if not k.startswith("encoder.")
+                }
                 full_dict.update(copy.deepcopy(sd))
             else:
-                sd = src.Utils.change_keys(layer_dict, self.cut_layers, True)
+                sd = {
+                    k: v
+                    for k, v in layer_dict.items()
+                    if not k.startswith("decoder.")
+                }
+
+                sd = src.Utils.change_keys(sd, self.cut_layers, True)
+
                 full_dict.update(copy.deepcopy(sd))
 
         return full_dict

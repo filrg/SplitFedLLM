@@ -5,34 +5,16 @@ from tqdm import tqdm
 from src.model.BERT import BERT
 from src.dataset.dataloader import dataloader
 
-def val_BERT(state_dict_full, cut_layers , bottleneck_config, logger):
+def val_BERT(state_dict_full, logger):
     criterion = nn.CrossEntropyLoss()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    test_loader = dataloader(model_name='BERT', train=False)
-    if bottleneck_config['enable']:
-        client = BERT(layer_id=1, n_block=cut_layers)
-        client_state_dict = client.state_dict()
-        for key in client_state_dict:
-            client_state_dict[key] = state_dict_full[0][key]
-        client.load_state_dict(client_state_dict)
-        client = client.to(device)
-        server = BERT(layer_id=2, n_block=12 - cut_layers)
-        server_state_dict = server.state_dict()
-        for key in server_state_dict:
-            server_state_dict[key] = state_dict_full[1][key]
-        server.load_state_dict(server_state_dict)
-        server = server.to(device)
-    else:
-        client = BERT(layer_id=1, n_block=cut_layers)
-        client.load_state_dict(state_dict_full[0])
-        client = client.to(device)
-        server = BERT(layer_id=2, n_block= 12 - cut_layers)
-        server.load_state_dict(state_dict_full[1])
-        server = server.to(device)
+    test_loader = dataloader(model_name='BERT', batch_size=4 ,distribution=[1000] ,train=False)
 
-    client.eval()
-    server.eval()
+    model = BERT()
+    model.load_state_dict(state_dict_full)
+    model = model.to(device)
+
     correct, total, total_loss = 0, 0, 0
 
     with torch.no_grad():
@@ -40,8 +22,7 @@ def val_BERT(state_dict_full, cut_layers , bottleneck_config, logger):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            logits = client(input_ids=input_ids)
-            logits = server(input_ids=logits)
+            logits = model(input_ids=input_ids)
             loss = criterion(logits, labels)
             if torch.isnan(loss).any():
                 return False

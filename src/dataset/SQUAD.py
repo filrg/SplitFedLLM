@@ -29,9 +29,9 @@ class SQUAD_DATASET(Dataset):
             pad_len        = max_length - seq_len
             attention_mask = [1] * seq_len + [0] * pad_len
             input_ids_pad  = input_ids + [self.pad_id] * pad_len
-            labels         = ([self.pad_id] * prefix_len
+            labels         = ([-100] * prefix_len
                                + suffix_ids
-                               + [self.pad_id] * pad_len)
+                               + [-100] * pad_len)
 
             self.samples.append({
                 "input_ids":      torch.tensor(input_ids_pad,   dtype=torch.long),

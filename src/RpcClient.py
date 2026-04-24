@@ -138,10 +138,10 @@ class RpcClient:
                     src.Log.print_with_color(f"Label: {label_counts[stt]}", 'yellow')
                     self.train_loader = dataloader(self.model_name, batch_size, label_counts[stt], train=True)
 
-                result, size = self.model_train.first_layer(self.model, lr, weight_decay,
+                result, size = self.model_train.first_layer(self.model, self.fine_tune_config['client'], lr, weight_decay,
                                                             control_count, self.train_loader)
             else:
-                result, size = self.model_train.last_layer(self.model, lr, weight_decay)
+                result, size = self.model_train.last_layer(self.model, self.fine_tune_config['client'], lr, weight_decay)
 
             # Stop training, then send parameters to server
             if self.layer_id == 1:

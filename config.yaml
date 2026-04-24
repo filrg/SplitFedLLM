@@ -6,7 +6,7 @@ server:
     - 1
   cut-layers: 4
   model-name: BERT # GPT2 / BERT
-  data-name: AGNEWS # SQUAD / AGNEWS
+  data-name: AGNEWS # AGNEWS / E2E
   model:
     BERT:
       n_block: 12
@@ -23,7 +23,7 @@ server:
     dirichlet:
       alpha: 1
     refresh-each-round: True
-  random-seed: 1
+  random-seed: 42
 
 rabbit:
   address: 127.0.0.1
