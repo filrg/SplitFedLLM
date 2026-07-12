@@ -74,3 +74,10 @@ python client.py --layer_id 1
 ```
 Where:
 - `--layer_id` is the index of client's layer, start from 1
+### Bottleneck
+Select the bottleneck from the pretrain folder and rename it.
+
+Example:
+```commandline
+mv bottleneck1_8.pt bottleneck.pt
+```
