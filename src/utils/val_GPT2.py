@@ -70,6 +70,7 @@ model = GPT2()
 state_dict = torch.load("GPT2.pt", map_location=device)
 model.load_state_dict(state_dict)
 model.to(device)
+model.eval()
 
 test_samples = pd.read_csv("./data/E2E/devset.csv")
 
@@ -95,19 +96,17 @@ for mr, ref in tqdm(mr_to_refs.items()):
     prompt = f"<MR> {mr} </MR> Answer: "
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
     attention_mask = torch.ones(input_ids.shape, device=device)
-
-    output_ids = simple_generate(model, input_ids, attention_mask, 50, pad_id, device)
+    with torch.no_grad():
+        output_ids = simple_generate(model, input_ids, attention_mask, 50, pad_id, device)
     full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     answer = full_text.split("Answer: ")[-1].strip()
-
     predictions.append(answer)
     references.append(ref)
-    break
 
-# bleu = compute_bleu(references, predictions)
+bleu = compute_bleu(references, predictions)
 rouge_l = compute_rouge_l(references, predictions)
 
-# print(bleu)
+print(bleu)
 print(rouge_l)
 
 

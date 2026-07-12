@@ -46,5 +46,5 @@ def val_GPT2(state_dict_full, logger):
     avg_loss = total_loss / max(len(test_loader), 1)
 
     logger.log_info(f"Test Loss: {avg_loss:.4f}")
-
+    print(f"Test Loss: {avg_loss:.4f}")
     return True

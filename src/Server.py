@@ -122,7 +122,7 @@ class Server:
                 src.Log.print_with_color("All clients are connected. Sending notifications.", "green")
 
                 self.distribution()
-
+                print(f"Start training round 1")
                 self.logger.log_info(f"Start training round 1")
                 self.notify_clients()
 
@@ -169,29 +169,25 @@ class Server:
 
                 self.count_update = [0 for _ in range(len(self.total_clients))]
                 # Test
-                if self.save_parameters and self.validation and self.round_result:
+                if self.save_parameters and self.round_result:
                     state_dict_full = self.concatenate()
+                    if self.validation:
+                        if not get_val(self.model_name, state_dict_full, self.logger):
+                            self.logger.log_warning("Training failed!")
+                            self.round = 0
 
-                    if not get_val(self.model_name, state_dict_full, self.logger):
-                        self.logger.log_warning("Training failed!")
-                        self.round = 0
-                    else:
                         # Save to files
-                        torch.save(state_dict_full, f'{self.model_name}.pt')
-                        self.round -= 1
-                    self.avg_state_dict = []
-                else:
-                    self.round = 0
+                    torch.save(state_dict_full, f'{self.model_name}.pt')
+
+                self.round -= 1
+                self.avg_state_dict = []
 
                 # Start a new training round
-                self.round_result = True
-
                 if self.round > 0:
+                    print(f"Start training round {self.global_round - self.round + 1}")
                     self.logger.log_info(f"Start training round {self.global_round - self.round + 1}")
-                    if self.save_parameters:
-                        self.notify_clients()
-                    else:
-                        self.notify_clients(register=False)
+                    self.notify_clients()
+
                 else:
                     self.logger.log_info("Stop training !!!")
                     self.notify_clients(start=False)
