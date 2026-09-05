@@ -3,9 +3,7 @@ import pickle
 import copy
 
 import src.Log
-from src.fine_tune.GPT2 import Ft_GPT2
-from src.fine_tune.Llama import Ft_Llama
-from src.fine_tune.Bert import Ft_Bert
+from src.fine_tune.scheduler import create_scheduler
 from src.dataset.dataloader import dataloader
 from src.model.GPT2 import GPT2
 from src.model.Llama import Llama
@@ -57,12 +55,9 @@ class RpcClient:
             weight_decay = self.response["weight_decay"]
             control_count = self.response["control_count"]
 
-            if model_name == 'GPT2':
-                self.model_train = Ft_GPT2(self.client_id, self.layer_id, self.channel, self.device)
-            elif model_name == 'Llama':
-                self.model_train = Ft_Llama(self.client_id, self.layer_id, self.channel, self.device)
-            elif model_name == 'Bert':
-                self.model_train = Ft_Bert(self.client_id, self.layer_id, self.channel, self.device)
+            self.model_train = create_scheduler(
+                model_name, self.client_id, self.layer_id, self.channel, self.device
+            )
 
             if fine_tune_config['name'] == 'LoRA':
                 if model_name == 'GPT2':
