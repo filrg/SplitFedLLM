@@ -107,13 +107,14 @@ class GPT2(nn.Module):
                 GPT2Block(n_embd, n_head, dropout)
                 for _ in range(n_block)
             ])
-        elif self.layer_id == 2:
+        elif self.layer_id in (2, 3, 4):
             self.h = nn.ModuleList([
                 GPT2Block(n_embd, n_head, dropout)
                 for _ in range(n_block)
             ])
-            self.ln_f = nn.LayerNorm(n_embd)
-            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+            if self.layer_id != 3:  # U-shape body never owns the output head.
+                self.ln_f = nn.LayerNorm(n_embd)
+                self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         else:
             self.wte = nn.Embedding(vocab_size, n_embd)
             self.wpe = nn.Embedding(max_length, n_embd)
@@ -142,13 +143,14 @@ class GPT2(nn.Module):
             for blk in self.h:
                 h = blk(h, mask)
 
-        elif self.layer_id == 2:
+        elif self.layer_id in (2, 3, 4):
             h = input_ids
             mask = attention_mask
             for blk in self.h:
                 h = blk(h, attention_mask)
-            h = self.ln_f(h)
-            h = self.lm_head(h)
+            if self.layer_id != 3:
+                h = self.ln_f(h)
+                h = self.lm_head(h)
 
         else:
             B, T = input_ids.shape

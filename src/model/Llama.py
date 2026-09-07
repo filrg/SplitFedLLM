@@ -187,13 +187,14 @@ class Llama(nn.Module):
                 LlamaDecoderLayer(hidden_size, num_attention_heads, num_key_value_heads, intermediate_size) for _ in
                 range(n_block)
             ])
-        elif self.layer_id == 2:
+        elif self.layer_id in (2, 3, 4):
             self.layers = nn.ModuleList([
                 LlamaDecoderLayer(hidden_size, num_attention_heads, num_key_value_heads, intermediate_size) for _ in
                 range(n_block)
             ])
-            self.norm = LlamaRMSNorm(hidden_size)
-            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            if self.layer_id != 3:  # U-shape body never owns the output head.
+                self.norm = LlamaRMSNorm(hidden_size)
+                self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         else:
             self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
             self.layers = nn.ModuleList([
@@ -217,13 +218,14 @@ class Llama(nn.Module):
             for decode in self.layers:
                 x = decode(x, masks)
 
-        elif self.layer_id == 2:
+        elif self.layer_id in (2, 3, 4):
             x = input_ids
             masks = attention_mask
             for decode in self.layers:
                 x = decode(x, masks)
-            x = self.norm(x)
-            x = self.lm_head(x)
+            if self.layer_id != 3:
+                x = self.norm(x)
+                x = self.lm_head(x)
 
         else:
             B, T = input_ids.shape

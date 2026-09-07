@@ -2,6 +2,7 @@ import argparse
 import sys
 import signal
 from src.Server import Server
+from src.UShapeServer import UShapeServer
 from src.Utils import delete_old_queues
 import src.Log
 import yaml
@@ -27,6 +28,9 @@ def signal_handler(sig, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     delete_old_queues(address, username, password, virtual_host)
-    server = Server(config)
+    architecture = config['server'].get('architecture', 'u-shape')
+    if architecture not in ('u-shape', 'split'):
+        raise ValueError(f'Unknown architecture: {architecture}')
+    server = (UShapeServer if architecture == 'u-shape' else Server)(config)
     server.start()
     src.Log.print_with_color("Ok, ready!", "green")

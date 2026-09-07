@@ -187,14 +187,15 @@ class Bert(nn.Module):
                 [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
                  for _ in range(n_block)]
             )
-        elif self.layer_id == 2:
+        elif self.layer_id in (2, 3, 4):
             self.layers = nn.ModuleList(
                 [BertLayer(hidden_size, num_attention_heads, intermediate_size, dropout_prob)
                  for _ in range(n_block)]
             )
-            self.pooler = BertPooler(hidden_size)
-            self.dropout = nn.Dropout(dropout_prob)
-            self.classifier = nn.Linear(hidden_size, 4)
+            if self.layer_id != 3:  # U-shape body never owns the classifier.
+                self.pooler = BertPooler(hidden_size)
+                self.dropout = nn.Dropout(dropout_prob)
+                self.classifier = nn.Linear(hidden_size, 4)
         else:
             self.embeddings = BertEmbeddings(vocab_size=vocab_size, hidden_size=hidden_size,
                                              max_position_embeddings=max_position_embeddings,
@@ -213,13 +214,14 @@ class Bert(nn.Module):
             x = self.embeddings(input_ids, token_type_ids)
             for encode in self.layers:
                 x = encode(x)
-        elif self.layer_id == 2:
+        elif self.layer_id in (2, 3, 4):
             x = input_ids
             for encode in self.layers:
                 x = encode(x)
-            x = self.pooler(x)
-            x = self.dropout(x)
-            x = self.classifier(x)
+            if self.layer_id != 3:
+                x = self.pooler(x)
+                x = self.dropout(x)
+                x = self.classifier(x)
         else:
             x = self.embeddings(input_ids, token_type_ids)
             for encode in self.layers:

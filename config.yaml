@@ -1,10 +1,12 @@
 name: SplitFedLLM
 server:
+  architecture: u-shape # layer_id 1: owner (front + tail), layer_id 2: body worker
   global-round: 1
   clients:
     - 1
     - 1
   cut-layers: 4
+  tail-blocks: 0 # Head and final normalization stay local even with zero tail blocks
   model-name: Bert # GPT2/Llama/Bert
   data-name: EMOTION # EMOTION/GSM8K
   model:
@@ -42,6 +44,11 @@ learning:
   batch-size: 2
   control-count: 1 # First-stage graph window; >1 averages gradients before each update
   clip-grad-norm: 0.0
+  u-shape:
+    max-inflight: 2
+    microbatches-per-window: 8 # Per-owner quota; may exceed max-inflight
+    worker-max-inflight: 8 # Total live body graphs; at least the number of assigned owners
+    timeout-seconds: 120
 
 fine-tune:
   enable: True

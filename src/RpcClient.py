@@ -40,6 +40,8 @@ class RpcClient:
         state_dict = self.response["parameters"]
 
         if action == "START":
+            if self.response.get("architecture") == "u-shape":
+                return self._u_shape_round(self.response)
             model = None
             model_name = self.response["model_name"]
             cut_layers = self.response['cut_layers']
@@ -152,3 +154,58 @@ class RpcClient:
                                    body=pickle.dumps(message))
 
         return self.response
+
+    def _u_shape_round(self, config):
+        from src.model.u_shape import build_partition, apply_lora, merge_lora
+        from src.fine_tune.u_shape import UShapeScheduler
+        role = config["role"]
+        if (role == "owner") != (self.layer_id == 1):
+            raise ValueError("Coordinator role does not match layer_id")
+        try:
+            self.channel.confirm_delivery()
+            model = build_partition(config["model_name"], role, config["cut_layers"],
+                                    config["total_block"], config["tail_blocks"])
+            model.load_state_dict(config["parameters"], strict=True)
+            fine_tune = config["fine_tune_config"]
+            if fine_tune["enable"]:
+                if fine_tune["name"] != "LoRA":
+                    raise ValueError("U-shape currently supports LoRA or full fine-tuning")
+                model = apply_lora(model, config["model_name"], role, fine_tune["LoRA"])
+            def scheduler(phase):
+                return UShapeScheduler(
+                    config["model_name"], self.client_id, self.channel, self.device,
+                    session=f'{config["session"]}_{phase}', worker_id=config["worker_id"],
+                    owner_ids=config["owner_ids"], max_inflight=config["max_inflight"],
+                    microbatches_per_window=config["microbatches_per_window"],
+                    worker_max_inflight=config["worker_max_inflight"], timeout=config["timeout"])
+            self.model_train = scheduler("train")
+            if role == "owner":
+                if self.train_loader is None:
+                    self.train_loader = dataloader(config["model_name"], config["data_name"],
+                                                   config["batch_size"], config["num_sample"], train=True)
+                result, size = self.model_train.owner(model, self.train_loader, config["lr"],
+                                                      config["weight_decay"], config["clip_grad_norm"])
+            else:
+                result, size = self.model_train.worker(model, config["lr"], config["weight_decay"],
+                                                       config["clip_grad_norm"])
+            print(f'U-shape local scheduler statistics: {self.model_train.stats}')
+            if config["validation"]:
+                evaluator = scheduler("eval")
+                if role == "owner":
+                    loader = dataloader(config["model_name"], config["data_name"],
+                                        config["batch_size"], config["num_sample"], train=False)
+                    evaluator.owner(model, loader, config["lr"], training=False)
+                    metrics = evaluator.local_metrics
+                    print('Local validation loss:', metrics["loss_sum"] / max(metrics["batches"], 1))
+                else:
+                    evaluator.worker(model, config["lr"], training=False)
+            model = merge_lora(model, role)
+            state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            self.send_to_server(dict(action="UPDATE", client_id=self.client_id, layer_id=self.layer_id,
+                                     session=config["session"], result=result, size=size,
+                                     message="U-shape partitions updated", parameters=state))
+            return True
+        except Exception:
+            self.send_to_server(dict(action="FAILED", client_id=self.client_id, layer_id=self.layer_id,
+                                     session=config["session"], message="U-shape round failed"))
+            raise

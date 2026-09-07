@@ -7,3 +7,5 @@ peft
 numpy
 nltk
 rouge_score
+requests
+PyYAML

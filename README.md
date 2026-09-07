@@ -70,7 +70,105 @@ python client.py --layer_id 1
 Where:
 - `--layer_id` is the index of client's layer, start from 1
 
-## Shared training scheduler
+## U-shape runtime (default)
+
+`server.architecture: u-shape` keeps embeddings/early blocks **and the output
+head/loss** on the data owner. Remote workers run only the transformer body.
+Token IDs, labels, logits, predictions and per-example losses are never included
+in U-shape messages. Activations, hidden-state gradients, model updates and padding
+metadata still leave the device; this is not a formal guarantee against inference
+attacks on those values.
+
+```text
+Owner/front --hidden--> Worker/body --hidden--> Owner/tail + local loss
+Owner/front <--grad---- Worker/body <--grad---- Owner/tail backward
+```
+
+`cut-layers` is the number of front blocks; `tail-blocks` is the number of final
+blocks also kept on the owner. With `tail-blocks: 0`, the head and final
+normalization (or BERT pooler/classifier) still remain local. There must be at
+least one remote body block. LoRA and full fine-tuning work with all three models.
+The existing models use untied embedding/head weights; the partition factory
+does not add support for externally supplied architectures with tied weights.
+
+Example with four owners and two workers:
+
+```yaml
+server:
+  architecture: u-shape
+  clients: [4, 2]
+  cut-layers: 4
+  tail-blocks: 0
+learning:
+  u-shape:
+    max-inflight: 2
+    microbatches-per-window: 8
+    worker-max-inflight: 8
+    timeout-seconds: 120
+```
+
+Run `python server.py`, then start four owner processes with
+`python client.py --layer_id 1` and two worker processes with
+`python client.py --layer_id 2`. Each process uses the configured broker;
+`--device cpu` or `--device cuda` selects its compute device. The coordinator
+assigns owners evenly to workers and pins each group's routes for the round.
+There must be at least as many owners as workers.
+
+`max-inflight` bounds live microbatches per owner. `worker-max-inflight` bounds
+live body graphs across the group and must be at least its number of owners.
+The effective per-owner credit is the smaller of `max-inflight` and
+`floor(worker-max-inflight / owners_in_group)`. `microbatches-per-window` is a
+per-owner update quota, independent of the credit limit. A released slot is
+refilled immediately within the same window; backwards and tail work are serviced
+before new forwards. Different owners/workers can overlap computation without
+concurrent writes to a GPU's parameter gradients.
+
+All group members keep parameters unchanged until every owner has drained its
+window. The worker steps and sends COMMIT; owners step front+tail together before
+entering the next window. The objective is the **mean of per-microbatch mean
+losses across the group**, scaled once at the local loss. This is not a global
+token-weighted mean when batch sizes/token counts differ. Positive gradient
+clipping applies separately to the owner partition and worker partition. Empty
+owners and partial final windows participate in the barrier without extra steps.
+
+Each group trains independently. At round end, `src/UShapeServer.py` FedAvgs
+owner and body partitions using processed sample counts. `parameters.save` controls
+disk persistence; aggregation and redistribution occur even when saving is off.
+The original full-model checkpoint key names are preserved, and checkpoints are
+written via a temporary file and atomic replacement. Validation, when enabled,
+runs locally at owners before FedAvg and reports only local mean loss; it does
+not perform the legacy centralized generation/accuracy evaluation.
+
+The protocol uses session/window IDs, dedicated per-node queues, manual ACKs,
+publisher confirms in RpcClient, and duplicate suppression within a live process.
+Timeout, nonfinite tensors/loss or peer failure aborts the round. It does **not**
+resume a lost autograd graph or provide durable exactly-once optimizer updates:
+restart all participants from the last completed round checkpoint. Old U-shape
+queues are removed by the existing testbed startup cleanup.
+
+Implementation: `src/model/u_shape.py` (partitions/checkpoint/LoRA),
+`src/fine_tune/u_shape.py` (common scheduler), `src/UShapeServer.py` (coordinator),
+and the U-shape branch in `src/RpcClient.py`. See
+[the architecture design](docs/u_shape_design.md) for rationale and planned
+optimizations. Direct tensor transport, adaptive routing and cross-owner tensor
+batching remain profiling-driven extensions; the current data plane is RabbitMQ.
+
+Run the offline regression/integration tests:
+
+```commandline
+python -m unittest discover -s tests -v
+```
+
+Tests exercise actual small BERT/GPT-2/Llama partitions, monolithic gradient and
+update equivalence, dropout, graph release, LoRA merge, multiple owners, uneven
+windows, reordering/duplicates, local validation, and two-round RpcClient/FedAvg
+integration using an in-memory broker. No model download is needed for tests.
+Real-broker/GPU throughput must be measured on the target testbed.
+
+## Legacy two-stage scheduler (`server.architecture: split`)
+
+This opt-in compatibility mode sends labels to the last stage. Use U-shape for
+local-label training.
 
 `src/fine_tune/scheduler.py` implements the first/last-stage training loops,
 RabbitMQ transport, backpressure, optimizer steps and round completion for all

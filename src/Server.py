@@ -12,7 +12,6 @@ import src.Utils
 from src.model.GPT2 import GPT2
 from src.model.Llama import Llama
 from src.model.Bert import Bert
-from src.val.get_val import get_val
 
 class Server:
     def __init__(self, config):
@@ -161,6 +160,7 @@ class Server:
                 self.count_update = [0 for _ in range(len(self.total_clients))]
                 # Test
                 if self.save_parameters and self.validation and self.round_result:
+                    from src.val.get_val import get_val
                     state_dict_full = self.concatenate()
                     self.avg_state_dict = []
                     if not get_val(self.model_name, self.data_name, state_dict_full,self.logger):
