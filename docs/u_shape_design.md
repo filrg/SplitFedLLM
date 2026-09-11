@@ -4,12 +4,13 @@ Trạng thái: runtime U-shape cơ bản đã triển khai trong `src/fine_tune/
 `src/model/u_shape.py` và `src/UShapeServer.py`. README mô tả chính xác cấu hình và
 hành vi hiện có. Tài liệu này vẫn giữ các hướng tối ưu mở rộng làm mục tiêu thiết kế.
 
-Phạm vi bản triển khai: ba model hiện có với weights untied, route cố định theo
-round, credit cố định, cửa sổ đồng bộ theo group, objective mean microbatch,
-validation loss local trước FedAvg, và truyền tensor qua RabbitMQ. Chưa triển khai
-adaptive load balancing, batching nhiều owner, tensor data plane riêng hoặc tự
-khôi phục model/optimizer/RNG sau lỗi process. Lỗi sẽ abort round và yêu cầu
-restart từ checkpoint của round đã hoàn tất.
+Cập nhật runtime: đã có TCP tensor data plane, buffer pool, CUDA events và WRR
+ở mức microbatch giữa nhiều worker. Owner chờ COMMIT của toàn bộ worker mỗi cửa sổ;
+body replicas cập nhật riêng trong round và FedAvg cuối round. Trọng số WRR có thể
+cập nhật theo EWMA của tốc độ compute. README mô tả cấu hình và các giới hạn hiện tại.
+Chưa triển khai batching nhiều owner, RDMA hoặc tự khôi phục model/optimizer/RNG
+sau lỗi process. Các phần thiết kế lịch sử bên dưới là bối cảnh; khi khác nhau,
+README mô tả runtime hiện hành.
 
 ## 1. Mục tiêu và ranh giới privacy
 

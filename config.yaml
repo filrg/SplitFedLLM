@@ -45,6 +45,11 @@ learning:
   control-count: 1 # First-stage graph window; >1 averages gradients before each update
   clip-grad-norm: 0.0
   u-shape:
+    transport: tcp # Tensor data goes directly to peers; RabbitMQ carries control messages
+    pinned-memory: auto # on/off overrides for per-device Jetson benchmarking
+    pool-bytes: 67108864 # Per pool, allocated lazily; activation/gradient reserves are separate
+    transport-queue-size: 32
+    adaptive-weights: true # EWMA of worker compute tokens/s, applied at window boundaries
     max-inflight: 2
     microbatches-per-window: 8 # Per-owner quota; may exceed max-inflight
     worker-max-inflight: 8 # Total live body graphs; at least the number of assigned owners

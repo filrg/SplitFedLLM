@@ -12,7 +12,8 @@ from src.model.Bert import Bert
 from peft import LoraConfig, TaskType, get_peft_model
 
 class RpcClient:
-    def __init__(self, client_id, layer_id, channel, device):
+    def __init__(self, client_id, layer_id, channel, device, tensor_transport=None):
+        self.tensor_transport = tensor_transport
         self.client_id = client_id
         self.layer_id = layer_id
         self.channel = channel
@@ -163,6 +164,12 @@ class RpcClient:
             raise ValueError("Coordinator role does not match layer_id")
         try:
             self.channel.confirm_delivery()
+            transport = None
+            if config.get("transport", "rabbitmq") == "tcp":
+                transport = self.tensor_transport
+                if transport is None:
+                    raise ValueError("TCP mode requires a registered tensor listener")
+                transport.configure(config["session"], config["tensor_key"], config["tensor_endpoints"])
             model = build_partition(config["model_name"], role, config["cut_layers"],
                                     config["total_block"], config["tail_blocks"])
             model.load_state_dict(config["parameters"], strict=True)
@@ -177,7 +184,9 @@ class RpcClient:
                     session=f'{config["session"]}_{phase}', worker_id=config["worker_id"],
                     owner_ids=config["owner_ids"], max_inflight=config["max_inflight"],
                     microbatches_per_window=config["microbatches_per_window"],
-                    worker_max_inflight=config["worker_max_inflight"], timeout=config["timeout"])
+                    worker_max_inflight=config["worker_max_inflight"], timeout=config["timeout"], transport=transport,
+                    worker_ids=config.get("worker_ids"), worker_weights=config.get("worker_weights"),
+                    adaptive_weights=config.get("adaptive_weights", True))
             self.model_train = scheduler("train")
             if role == "owner":
                 if self.train_loader is None:
@@ -199,6 +208,9 @@ class RpcClient:
                     print('Local validation loss:', metrics["loss_sum"] / max(metrics["batches"], 1))
                 else:
                     evaluator.worker(model, config["lr"], training=False)
+            if transport is not None:
+                transport.drain()
+                print('TCP tensor transport statistics:', transport.stats())
             model = merge_lora(model, role)
             state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             self.send_to_server(dict(action="UPDATE", client_id=self.client_id, layer_id=self.layer_id,

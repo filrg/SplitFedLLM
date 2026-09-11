@@ -5,15 +5,18 @@ Graphs are process-local; a failed process requires restarting the round.
 """
 
 import pickle
+import math
 import time
 
 import torch
 
 from src.fine_tune.adapters import get_adapter
+from src.fine_tune.fair_queue import WeightedRoundRobin
+from src.transport.tcp import TENSOR_KINDS
 
 
 FIELDS = {
-    "PLAN": {"count", "last"},
+    "PLAN": {"count", "total_count", "last"},
     "OPEN": {"count", "credit"},
     "BODY_FORWARD": {"tensor", "padding_mask"},
     "TAIL_FORWARD": {"tensor"},
@@ -22,7 +25,7 @@ FIELDS = {
     "EVAL_DONE": set(),
     "FRONT_DONE": set(),
     "DRAINED": set(),
-    "COMMIT": {"last"},
+    "COMMIT": {"last", "capacity"},
     "ABORT": set(),
 }
 ENVELOPE = {"protocol", "session", "window", "type", "owner", "worker", "microbatch"}
@@ -32,13 +35,18 @@ OWNER_MESSAGES = {"PLAN", "BODY_FORWARD", "BODY_BACKWARD", "EVAL_DONE", "DRAINED
 class UShapeScheduler:
     def __init__(self, model_name, client_id, channel, device, *, session,
                  worker_id, owner_ids, max_inflight=2, microbatches_per_window=8,
-                 worker_max_inflight=8, timeout=120):
+                 worker_max_inflight=8, timeout=120, transport=None, worker_ids=None,
+                 worker_weights=None, adaptive_weights=True):
         self.client_id = str(client_id)
         self.worker_id = str(worker_id)
+        self.workers = tuple(map(str, worker_ids or [worker_id]))
+        if not self.workers or len(set(self.workers)) != len(self.workers):
+            raise ValueError("Worker IDs must be nonempty and unique")
+        self.is_worker = self.client_id in self.workers
         self.owners = tuple(map(str, owner_ids))
         if not self.owners or len(set(self.owners)) != len(self.owners):
             raise ValueError("A worker needs a nonempty, unique owner list")
-        if self.worker_id in self.owners or self.client_id not in (*self.owners, self.worker_id):
+        if set(self.workers) & set(self.owners) or self.client_id not in (*self.owners, *self.workers):
             raise ValueError("Invalid U-shape membership")
         for value in (max_inflight, microbatches_per_window, worker_max_inflight):
             if type(value) is not int or value < 1:
@@ -47,6 +55,14 @@ class UShapeScheduler:
             raise ValueError("worker_max_inflight must reserve at least one graph per owner")
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        self.transport = transport
+        self.max_inflight = max_inflight
+        self.routing = WeightedRoundRobin({node: (worker_weights or {}).get(node, 1) for node in self.workers})
+        self.adaptive_weights = adaptive_weights
+        self.measured_weights = {}
+        self.compute_seconds = 0.0
+        self.compute_tokens = 0
+        self.compute_events = []
         self.channel = channel
         self.device = device
         self.session = str(session)
@@ -72,43 +88,74 @@ class UShapeScheduler:
             self.declared.add(queue)
         return queue
 
-    def _send(self, kind, owner, microbatch=-1, **payload):
+    def _send(self, kind, owner, microbatch=-1, worker_id=None, **payload):
         if set(payload) != FIELDS[kind]:
             raise ValueError(f"Invalid fields for {kind}: {set(payload)}")
+        worker_id = worker_id or self.worker_id
         message = dict(protocol=1, session=self.session, window=self.window,
-                       type=kind, owner=owner, worker=self.worker_id, microbatch=microbatch)
+                       type=kind, owner=owner, worker=worker_id, microbatch=microbatch)
+        target = worker_id if kind in OWNER_MESSAGES else owner
+        if self.transport is not None and kind in TENSOR_KINDS:
+            message.update(payload)
+            self.transport.send(target, message)
+            self.last_activity = time.monotonic()
+            return
         for key, value in payload.items():
             message[key] = value.detach().cpu() if torch.is_tensor(value) else value
-        target = self.worker_id if kind in OWNER_MESSAGES else owner
-        if kind == "ABORT" and self.client_id != self.worker_id:
-            target = self.worker_id
+        if kind == "ABORT" and not self.is_worker:
+            target = worker_id
         wire = pickle.dumps(message)
         self.channel.basic_publish(exchange='', routing_key=self._queue(target, kind), body=wire)
         self.stats["wire_bytes"] += len(wire)
         self.last_activity = time.monotonic()
 
-    def _ack(self, message):
-        self.channel.basic_ack(delivery_tag=message.pop("_delivery"))
-        self.seen.add((message["window"], message["type"], message["owner"], message["microbatch"]))
+    def _ack(self, message, keep=False):
+        receipt = message.pop("_receipt", None)
+        if receipt is not None:
+            if not keep:
+                receipt.release()
+        else:
+            self.channel.basic_ack(delivery_tag=message.pop("_delivery"))
+        self.seen.add((message["window"], message["type"], message["owner"], message["worker"], message["microbatch"]))
 
     def _poll(self, *kinds):
+        if self.transport is not None:
+            self.transport.check()
         for kind in ("ABORT", *kinds):
-            method, _, body = self.channel.basic_get(queue=self._queue(self.client_id, kind), auto_ack=False)
-            if not method:
-                continue
-            message = pickle.loads(body)
+            receipt = None
+            if self.transport is not None and kind in TENSOR_KINDS:
+                receipt = self.transport.poll(self.session, kind)
+                if receipt is None:
+                    continue
+                message = receipt.message
+            else:
+                method, _, body = self.channel.basic_get(queue=self._queue(self.client_id, kind), auto_ack=False)
+                if not method:
+                    continue
+                message = pickle.loads(body)
             if (set(message) != ENVELOPE | FIELDS[kind] or message["type"] != kind
                     or message["protocol"] != 1 or message["session"] != self.session
-                    or message["worker"] != self.worker_id or message["owner"] not in self.owners
-                    or (self.client_id != self.worker_id and message["owner"] != self.client_id)):
+                    or message["worker"] not in self.workers or message["owner"] not in self.owners
+                    or (self.is_worker and message["worker"] != self.client_id)
+                    or (not self.is_worker and message["owner"] != self.client_id)):
+                if receipt is not None:
+                    receipt.release()
                 raise ValueError("Invalid U-shape envelope or route")
-            key = (message["window"], kind, message["owner"], message["microbatch"])
+            key = (message["window"], kind, message["owner"], message["worker"], message["microbatch"])
             if kind != "ABORT" and (key in self.seen or message["window"] < self.window):
-                self.channel.basic_ack(delivery_tag=method.delivery_tag)
-                continue  # Re-delivery never triggers a second backward or step.
+                if receipt is not None:
+                    receipt.release()
+                else:
+                    self.channel.basic_ack(delivery_tag=method.delivery_tag)
+                continue
             if kind != "ABORT" and message["window"] != self.window:
+                if receipt is not None:
+                    receipt.release()
                 raise ValueError("Unexpected model/window version")
-            message["_delivery"] = method.delivery_tag
+            if receipt is not None:
+                message["_receipt"] = receipt
+            else:
+                message["_delivery"] = method.delivery_tag
             self.last_activity = time.monotonic()
             if kind == "ABORT":
                 self._ack(message)
@@ -129,21 +176,45 @@ class UShapeScheduler:
             self._idle()
 
     def _abort(self):
-        # Never include exception text: it could contain private input/labels.
-        for owner in self.owners if self.client_id == self.worker_id else (self.client_id,):
+        routes = [(owner, self.worker_id) for owner in self.owners] if self.is_worker else [
+            (self.client_id, worker) for worker in self.workers]
+        for owner, worker in routes:
             try:
-                self._send("ABORT", owner)
+                self._send("ABORT", owner, worker_id=worker)
             except Exception:
-                pass  # The original exception remains the cause of failure.
+                pass
+
+    def _compute_start(self):
+        if torch.device(self.device).type == "cuda":
+            event = torch.cuda.Event(enable_timing=True)
+            event.record(torch.cuda.current_stream(self.device))
+            return event
+        return time.perf_counter()
+
+    def _compute_end(self, started):
+        if isinstance(started, float):
+            self.compute_seconds += time.perf_counter() - started
+        else:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record(torch.cuda.current_stream(self.device))
+            self.compute_events.append((started, event))
+
+    def _capacity(self):
+        for started, finished in self.compute_events:
+            finished.synchronize()  # Only at the drained optimizer boundary.
+            self.compute_seconds += started.elapsed_time(finished) / 1000.0
+        self.compute_events.clear()
+        return self.compute_tokens / self.compute_seconds if self.compute_seconds > 0 else 0.0
 
     def _tensor(self, value, *, like=None, leaf=False):
         if not torch.is_tensor(value) or not value.is_floating_point():
             raise ValueError("Expected a floating-point hidden state or gradient")
         if like is not None and (value.shape != like.shape or value.dtype != like.dtype):
             raise ValueError("Gradient shape/dtype mismatch")
-        tensor = value.to(self.device).detach()
-        if not torch.isfinite(tensor).all():
+        # TCP checked finiteness on CPU before scheduling H2D, avoiding another GPU sync.
+        if self.transport is None and not torch.isfinite(value).all():
             raise ValueError("Nonfinite hidden state or gradient")
+        tensor = value.to(self.device).detach()
         return tensor.requires_grad_(leaf)
 
     def _mask(self, padding, hidden):
@@ -170,7 +241,7 @@ class UShapeScheduler:
 
     def owner(self, model, loader, lr, weight_decay=0, clip_grad_norm=0, training=True):
         """Run front and tail on the data owner; labels remain in local pending state."""
-        if self.client_id == self.worker_id:
+        if self.is_worker:
             raise ValueError("Worker cannot run owner role")
         model.to(self.device).train(training)
         optimizer = self._optimizer(model, lr, weight_decay) if training else None
@@ -181,15 +252,24 @@ class UShapeScheduler:
             while True:
                 count = min(self.quota, remaining)
                 last = remaining == count
-                self._send("PLAN", self.client_id, count=count, last=last)
-                opened = self._wait("OPEN")
-                denominator, credit = opened["count"], opened["credit"]
-                if denominator < count or not 1 <= credit <= self.credit:
-                    raise ValueError("Invalid group window plan")
-                self._ack(opened)
+                routes = self.routing.allocate(count)
+                for worker in self.workers:
+                    self._send("PLAN", self.client_id, worker_id=worker,
+                               count=routes.count(worker), total_count=count, last=last)
+                credits, outstanding = {}, {worker: 0 for worker in self.workers}
+                denominator = None
+                while len(credits) < len(self.workers):
+                    opened = self._wait("OPEN")
+                    if (opened["count"] < count or not 1 <= opened["credit"] <= self.credit
+                            or (denominator is not None and denominator != opened["count"])):
+                        raise ValueError("Invalid group window plan")
+                    denominator = opened["count"]
+                    credits[opened["worker"]] = opened["credit"]
+                    self._ack(opened)
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
-                sent = completed = 0
+                unsent = list(range(count))
+                completed = 0
                 while completed < count:
                     # Process dependencies first, then immediately refill a free slot.
                     message = self._poll("FRONT_BACKWARD" if training else "FRONT_DONE", "TAIL_FORWARD")
@@ -198,6 +278,8 @@ class UShapeScheduler:
                         if index not in pending:
                             raise ValueError("Gradient/hidden state has no matching local graph")
                         entry = pending[index]
+                        if message["worker"] != entry["worker"]:
+                            raise ValueError("Response from worker that does not own this graph")
                         if message["type"] == "TAIL_FORWARD":
                             if entry["phase"] != "tail":
                                 raise ValueError("Unexpected tail transition")
@@ -214,9 +296,9 @@ class UShapeScheduler:
                             self.local_metrics["batches"] += 1
                             if training:
                                 (loss / denominator).backward()
-                                self._send("BODY_BACKWARD", self.client_id, index, tensor=hidden.grad)
+                                self._send("BODY_BACKWARD", self.client_id, index, worker_id=entry["worker"], tensor=hidden.grad)
                             else:
-                                self._send("EVAL_DONE", self.client_id, index)
+                                self._send("EVAL_DONE", self.client_id, index, worker_id=entry["worker"])
                             entry["phase"] = "front"
                             del entry["labels"], hidden, output, loss
                             self.stats["tail_forward"] += 1
@@ -226,12 +308,16 @@ class UShapeScheduler:
                             if training:
                                 entry["output"].backward(self._tensor(message["tensor"], like=entry["output"]))
                             self.data_count += entry["size"]
+                            outstanding[entry["worker"]] -= 1
                             del pending[index]
                             completed += 1
                             self.stats["front_backward"] += int(training)
                         del entry
                         self._ack(message)
-                    if sent < count and len(pending) < credit:
+                    selected = next((i for i in unsent if outstanding[routes[i]] < credits[routes[i]]), None)
+                    if selected is not None and len(pending) < self.max_inflight:
+                        index = selected
+                        worker = routes[index]
                         batch = next(iterator)
                         inputs = batch["input_ids"].to(self.device)
                         labels = batch[self.adapter.label_key].to(self.device)
@@ -239,10 +325,12 @@ class UShapeScheduler:
                                    if self.adapter.uses_attention_mask else None)
                         with torch.set_grad_enabled(training):
                             output, _ = self.adapter.forward(model["front"], inputs, padding)
-                        pending[sent] = dict(output=output, labels=labels, padding=padding,
-                                             size=inputs.shape[0], phase="tail")
-                        self._send("BODY_FORWARD", self.client_id, sent, tensor=output, padding_mask=padding)
-                        sent += 1
+                        pending[index] = dict(output=output, labels=labels, padding=padding,
+                                              size=inputs.shape[0], phase="tail", worker=worker)
+                        self._send("BODY_FORWARD", self.client_id, index, worker_id=worker,
+                                   tensor=output, padding_mask=padding)
+                        outstanding[worker] += 1
+                        unsent.remove(index)
                         self.stats["front_forward"] += 1
                         self.stats["peak_pending"] = max(self.stats["peak_pending"], len(pending))
                         del batch, inputs, labels, padding, output
@@ -250,12 +338,29 @@ class UShapeScheduler:
                         self._idle()
                 if pending:
                     raise RuntimeError("Owner attempted to commit live graphs")
-                self._send("DRAINED", self.client_id)
-                committed = self._wait("COMMIT")
+                for worker in self.workers:
+                    self._send("DRAINED", self.client_id, worker_id=worker)
+                commits = {}
+                while len(commits) < len(self.workers):
+                    committed = self._wait("COMMIT")
+                    capacity = committed["capacity"]
+                    if not math.isfinite(capacity) or capacity < 0:
+                        raise ValueError("Invalid worker capacity")
+                    if capacity > 0:
+                        worker = committed["worker"]
+                        old = self.measured_weights.get(worker, capacity)
+                        self.measured_weights[worker] = 0.8 * old + 0.2 * capacity
+                    commits[committed["worker"]] = committed["last"]
+                    self._ack(committed)
+                if len(set(commits.values())) != 1:
+                    raise ValueError("Workers disagree about end of round")
+                if self.adaptive_weights and len(self.measured_weights) == len(self.workers):
+                    # Bound the ratio so a slow worker keeps receiving work for measurement.
+                    fastest = max(self.measured_weights.values())
+                    self.routing.update({w: max(v, fastest / 20) for w, v in self.measured_weights.items()})
                 if count and training:
                     self._step(model, optimizer, clip_grad_norm)
-                done = committed["last"]
-                self._ack(committed)
+                done = all(commits.values())
                 remaining -= count
                 self.window += 1
                 self.seen.clear()
@@ -269,7 +374,7 @@ class UShapeScheduler:
             raise
 
     def worker(self, model, lr, weight_decay=0, clip_grad_norm=0, training=True):
-        if self.client_id != self.worker_id:
+        if not self.is_worker:
             raise ValueError("Owner cannot run worker role")
         model.to(self.device).train(training)
         optimizer = self._optimizer(model, lr, weight_decay) if training else None
@@ -280,11 +385,16 @@ class UShapeScheduler:
                 while len(plans) < len(self.owners):
                     message = self._wait("PLAN")
                     if (type(message["count"]) is not int or not 0 <= message["count"] <= self.quota
+                            or type(message["total_count"]) is not int
+                            or not message["count"] <= message["total_count"] <= self.quota
                             or type(message["last"]) is not bool):
                         raise ValueError("Invalid owner quota")
-                    plans[message["owner"]] = (message["count"], message["last"])
+                    plans[message["owner"]] = (message["count"], message["last"], message["total_count"])
                     self._ack(message)
-                total = sum(count for count, _ in plans.values())
+                total = sum(plan[2] for plan in plans.values())
+                local_total = sum(plan[0] for plan in plans.values())
+                self.compute_seconds = 0.0
+                self.compute_tokens = 0
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
                 for owner in self.owners:
@@ -300,16 +410,20 @@ class UShapeScheduler:
                     owner, index = message["owner"], message["microbatch"]
                     key = owner, index
                     if message["type"] == "BODY_FORWARD":
-                        if owner in drained or not 0 <= index < plans[owner][0] or index in forwards[owner]:
+                        if (owner in drained or not 0 <= index < plans[owner][2] or index in forwards[owner]
+                                or len(forwards[owner]) >= plans[owner][0]):
                             raise ValueError("Forward outside owner quota")
                         outstanding = len(forwards[owner]) - backwards[owner]
                         if outstanding >= self.credit or len(pending) >= self.worker_limit:
                             raise ValueError("Owner exceeded graph credit")
                         inputs = self._tensor(message["tensor"], leaf=training)
                         padding = message["padding_mask"]
+                        started = self._compute_start()
                         with torch.set_grad_enabled(training):
                             output, _ = self.adapter.forward(model, inputs, self._mask(padding, inputs))
-                        pending[key] = (inputs, output) if training else inputs.shape[0]
+                        self._compute_end(started)
+                        self.compute_tokens += inputs.shape[0] * inputs.shape[1]
+                        pending[key] = (inputs, output, message.get("_receipt")) if training else inputs.shape[0]
                         forwards[owner].add(index)
                         self._send("TAIL_FORWARD", owner, index, tensor=output)
                         self.stats["body_forward"] += 1
@@ -319,8 +433,12 @@ class UShapeScheduler:
                         if key not in pending:
                             raise ValueError("Body gradient has no matching forward graph")
                         if training:
-                            inputs, output = pending.pop(key)
+                            inputs, output, receipt = pending.pop(key)
+                            started = self._compute_start()
                             output.backward(self._tensor(message["tensor"], like=output))
+                            self._compute_end(started)
+                            if receipt is not None:
+                                receipt.release()
                             self._send("FRONT_BACKWARD", owner, index, tensor=inputs.grad)
                             self.data_count += inputs.shape[0]
                             del inputs, output
@@ -333,19 +451,23 @@ class UShapeScheduler:
                         if backwards[owner] != plans[owner][0]:
                             raise ValueError("Owner drained before its backwards completed")
                         drained.add(owner)
-                    self._ack(message)
+                    self._ack(message, keep=training and message["type"] == "BODY_FORWARD")
                 if pending:
                     raise RuntimeError("Worker attempted to update live graphs")
-                if total and training:
+                if local_total and training:
                     self._step(model, optimizer, clip_grad_norm)
-                done = all(last for _, last in plans.values())
+                done = all(plan[1] for plan in plans.values())
+                capacity = self._capacity()
                 for owner in self.owners:
-                    self._send("COMMIT", owner, last=done)
+                    self._send("COMMIT", owner, last=done, capacity=capacity)
                 self.window += 1
                 self.seen.clear()
                 if done:
                     return True, self.data_count
         except Exception:
+            for entry in pending.values():
+                if isinstance(entry, tuple) and entry[2] is not None:
+                    entry[2].release()
             pending.clear()
             self._abort()
             raise
